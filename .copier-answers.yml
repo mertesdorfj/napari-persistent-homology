@@ -1,0 +1,18 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v2.1.0
+_src_path: d:/Chenhao_Napari_Plugin/napari-plugin-template
+display_name: Persistent Homology 3D
+email: jume@di.ku.dk
+full_name: Chenhao Wang, Julia Mertesdorf
+github_repository_url: https://github.com/mertesdorfj/napari-persistent-homology
+github_username_or_organization: mertesdorfj
+include_reader_plugin: false
+include_sample_data_plugin: true
+include_widget_plugin: true
+include_writer_plugin: false
+install_dependabot: true
+install_precommit: true
+license: BSD-3
+module_name: napari_persistent_homology
+plugin_name: napari-persistent-homology
+short_description: 3D shape analysis of binary segmentations using persistent homology

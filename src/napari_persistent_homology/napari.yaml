@@ -1,0 +1,43 @@
+name: napari-persistent-homology
+display_name: Persistent Homology 3D
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
+# categories: []
+contributions:
+  commands:
+    - id: napari-persistent-homology.make_sample_data
+      python_name: napari_persistent_homology._sample_data:make_sample_data
+      title: Load sample data from Persistent Homology 3D
+    - id: napari-persistent-homology.make_container_widget
+      python_name: napari_persistent_homology:ImageThreshold
+      title: Make threshold Container widget
+    - id: napari-persistent-homology.make_magic_widget
+      python_name: napari_persistent_homology:threshold_magic_widget
+      title: Make threshold magic widget
+    - id: napari-persistent-homology.make_function_widget
+      python_name: napari_persistent_homology:threshold_autogenerate_widget
+      title: Make threshold function widget
+    - id: napari-persistent-homology.make_qwidget
+      python_name: napari_persistent_homology:ExampleQWidget
+      title: Make example QWidget
+  sample_data:
+    - command: napari-persistent-homology.make_sample_data
+      display_name: Persistent Homology 3D
+      key: unique_id.1
+  widgets:
+    - command: napari-persistent-homology.make_container_widget
+      display_name: Container Threshold
+    - command: napari-persistent-homology.make_magic_widget
+      display_name: Magic Threshold
+    - command: napari-persistent-homology.make_function_widget
+      autogenerate: true
+      display_name: Autogenerate Threshold
+    - command: napari-persistent-homology.make_qwidget
+      display_name: Example QWidget
+  menus:
+    napari/layers/segment:
+      - command: napari-persistent-homology.make_container_widget
+      - command: napari-persistent-homology.make_magic_widget
+      - command: napari-persistent-homology.make_function_widget
+      - command: napari-persistent-homology.make_qwidget
