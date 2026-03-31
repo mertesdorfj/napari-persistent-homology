@@ -13,7 +13,7 @@
 
 ----------------------------------
 
-This [napari] plugin was generated with [copier] using the [napari-plugin-template] (None).
+This [napari] plugin wraps research code from [Wang et al. 2022](https://doi.org/10.1101/2022.11.08.515664) for 3D shape analysis of binary segmentation volumes using persistent homology.
 
 <!--
 Don't miss the full getting started guide to set up your new package:
