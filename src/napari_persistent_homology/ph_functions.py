@@ -357,7 +357,7 @@ def moving_average(x, w):
 
 
 def gaussian_average(x, sigma=1):
-    return scipy.ndimage.filters.gaussian_filter1d(x, sigma=sigma)
+    return scipy.ndimage.gaussian_filter1d(x, sigma=sigma)
 
 
 def find_max_location(series, offset=5):
