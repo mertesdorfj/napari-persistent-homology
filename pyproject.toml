@@ -85,7 +85,7 @@ addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 # filterwarnings = ["error"]  # recommended by PP309; deprecation warnings cause failures so leaving for the user to enable if desired
 log_cli_level = "INFO"
-testpaths = ["tests", "src"]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 79
