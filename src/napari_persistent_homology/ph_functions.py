@@ -11,10 +11,19 @@ Three analysis modes:
 * Function 'persistent_homology_erosion' — repeatedly shrinks the object;
   the object-count curve peaks at the typical half-thickness / radius.
 * Function 'persistent_homology_dilation' — repeatedly grows the object;
-  the hole-count curve peaks at the typical inter-object spacing.
+  the hole-count curve peaks where most surfaces make contact.
 * Function 'persistent_homology_dilation_internal_object' — same as dilation
   but the count is restricted to a container mask, for measuring spacing of
   objects inside a parent compartment (e.g. cristae inside a mitochondrion).
+  This is the variant used in the paper, where the dilated mask is multiplied
+  by the mitochondrion segmentation before hole counting.
+
+Per the paper, the count-curve peak location can be interpreted as *half* of
+the average minimum distance across the region being eroded or dilated:
+half-thickness/radius for erosion, half the inter-object gap for dilation
+(at the peak each surface has grown by the peak amount, so the gap is twice
+that). The FWHM measures surface roughness / curvature of the same region —
+rougher, more curved surfaces keep holes/objects alive over more rounds.
 
 Each routine returns '(object_count_curve, hole_count_curve)'. The relevant
 curve is then passed through function 'compute_homology_stats', which Gaussian-
@@ -23,8 +32,10 @@ peak/FWHM values are in subpixel-step units — divide by 'ceil(1 / Lambda)'
 to convert to voxel units.
 
 Source: Wang, Østergaard, Hasselholt, Sporring,
-"Extracting Mitochondrial Cristae Characteristics from 3D Focused Ion Beam
-Scanning Electron Microscopy Data", https://doi.org/10.1101/2022.11.08.515664
+"A semi-automatic method for extracting mitochondrial cristae characteristics
+from 3D focused ion beam scanning electron microscopy data",
+Communications Biology 7:377 (2024),
+https://doi.org/10.1038/s42003-024-06045-4
 """
 
 import os
@@ -507,11 +518,6 @@ def persistent_homology_erosion(
 ##############################################################################
 
 
-def moving_average(x, w):
-    """Simple moving-average filter of window size 'w' (valid mode)."""
-    return np.convolve(x, np.ones(w), 'valid') / w
-
-
 def gaussian_average(x, sigma=1):
     """1D Gaussian smoothing of a curve with the given 'sigma'."""
     return scipy.ndimage.gaussian_filter1d(x, sigma=sigma)
@@ -521,15 +527,16 @@ def find_max_location(series, offset=5):
     """
     Index of the last occurrence of the maximum of 'series[offset:]'.
 
-    The initial 'offset' samples are skipped to ignore the count-curve
-    artifact near step 0 (the original binary volume is not yet smoothed).
-    When several samples share the maximum value, the right-most one is
-    returned — this matches the convention used in the original paper for
-    locating the radius peak. If the whole post-offset series is zero, the
-    function returns 'offset' as a fallback.
+    The initial 'offset' samples are skipped because the count curve is most
+    susceptible to noise there. The paper excludes the first five subpixel
+    rounds — half of a full morphology round at 'Lambda = 0.1' — for this
+    reason, which is the source of the default 'offset = 5'. When several
+    samples share the maximum value, the right-most one is returned. If the
+    whole post-offset series is zero, the function returns 'offset' as a
+    fallback (the caller then treats the curve as degenerate).
     """
     if np.max(series[offset:]) == 0:
-        max_loc = 0 + 5
+        max_loc = offset
     else:
         max_loc = (
             len(series[offset:][::-1])
@@ -571,13 +578,13 @@ def compute_FWHM(series, offset=5):
             left_half, np.where(np.diff(left_half) != 1)[0] + 1
         )[-1][0]
     except IndexError:
-        left_index = left_index[0]
+        left_index = max_location
     try:
         right_index = np.split(
             right_half, np.where(np.diff(right_half) != 1)[0] + 1
         )[0][-1]
     except IndexError:
-        right_index = right_index[0]
+        right_index = max_location
     full_width_half_maximum = right_index - left_index
 
     return full_width_half_maximum
@@ -669,7 +676,7 @@ def plot_hist_fixed_width_save(
     x_mean = np.round(np.mean(x_data), 1)
     x_median = np.round(np.median(x_data), 1)
     x_std = np.round(np.std(x_data), 1)
-    x_MAD = np.round(stats.median_absolute_deviation(x_data, scale=1), 1)
+    x_MAD = np.round(stats.median_abs_deviation(x_data, scale=1), 1)
 
     stats_text = (
         'x_mean = '
@@ -785,7 +792,7 @@ def find_boundary_mitochondria_id(img_volume, seg_volume):
     """
     out_of_bounds_volume = img_volume == 0
 
-    out_of_bounds_volume = scipy.ndimage.morphology.binary_dilation(
+    out_of_bounds_volume = scipy.ndimage.binary_dilation(
         out_of_bounds_volume, iterations=3
     )
 

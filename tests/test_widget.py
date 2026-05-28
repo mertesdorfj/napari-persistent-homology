@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from napari_persistent_homology._widget import (
     _MODE_DILATION,
@@ -90,7 +91,8 @@ def _read_csv_rows(path):
     import csv as _csv
 
     rows = []
-    with open(path, encoding='utf-8', newline='') as f:
+    # utf-8-sig strips the BOM the widget now writes (so Excel decodes it).
+    with open(path, encoding='utf-8-sig', newline='') as f:
         for row in _csv.reader(f):
             if not row or (row[0].startswith('#')):
                 continue
@@ -138,9 +140,9 @@ def test_save_results_writes_summary_csv_dilation(
     tmp_path,
     monkeypatch,
 ):
-    """Save Results in dilation mode writes only TWO metrics ('Inter-
-    object spacing' + FWHM) — the width row is hidden in the GUI for
-    these modes, and the CSV mirrors that."""
+    """Save Results in dilation mode writes THREE metrics: the raw peak
+    ('Half-spacing'), twice that ('Inter-object spacing'), and FWHM —
+    mirroring the two GUI result rows plus FWHM."""
     viewer = make_napari_viewer()
     widget = PersistentHomologyWidget(viewer)
     _fake_completed_run(widget, mode_text=_MODE_DILATION)
@@ -157,11 +159,15 @@ def test_save_results_writes_summary_csv_dilation(
     assert rows[0] == ['Metric', 'Value_vox']
     metric_labels = [r[0] for r in rows[1:]]
     assert metric_labels == [
+        'Half-spacing',
         'Inter-object spacing',
         'Full-width at half-maximum',
     ]
-    # No 'Width / thickness' anywhere
-    assert not any('Width' in r[0] for r in rows[1:])
+    # Inter-object spacing must be exactly twice the half-spacing.
+    values = {r[0]: float(r[1]) for r in rows[1:]}
+    assert values['Inter-object spacing'] == pytest.approx(
+        2.0 * values['Half-spacing']
+    )
 
 
 def test_save_curve_writes_csv_and_png(
@@ -336,11 +342,13 @@ def test_reset_results_applies_current_mode_labels(make_napari_viewer):
     assert 'Radius' in widget._radius_row_label.text()
 
     # Trigger _reset_results (as the start of a Run click would): now the
-    # new-mode labels take effect.
+    # new-mode labels take effect. Dilation shows the raw peak as
+    # 'Half-spacing' and the doubled value as 'Inter-object spacing'.
     widget._reset_results()
-    assert widget._radius_row_label.text() == 'Inter-object spacing:'
-    assert widget._width_row_label.isHidden()
-    assert widget._width_label.isHidden()
+    assert widget._radius_row_label.text() == 'Half-spacing:'
+    assert widget._width_row_label.text() == 'Inter-object spacing:'
+    assert not widget._width_row_label.isHidden()
+    assert not widget._width_label.isHidden()
 
     # Switch back to erosion and reset again — labels restore
     widget._mode_combo.setCurrentText(_MODE_EROSION)
@@ -349,6 +357,28 @@ def test_reset_results_applies_current_mode_labels(make_napari_viewer):
     assert '(erosion)' in widget._radius_row_label.text()
     assert not widget._width_row_label.isHidden()
     assert not widget._width_label.isHidden()
+
+
+def test_dilation_run_shows_half_and_full_spacing_in_gui(make_napari_viewer):
+    """End-to-end GUI check: a completed dilation run shows the raw peak as
+    'Half-spacing' and exactly twice that as 'Inter-object spacing', with
+    both rows visible."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+
+    # Set dilation mode, then run _reset_results (as a Run click would) so
+    # the row labels switch to the dilation terminology.
+    widget._mode_combo.setCurrentText(_MODE_DILATION)
+    widget._reset_results()
+    assert widget._radius_row_label.text() == 'Half-spacing:'
+    assert widget._width_row_label.text() == 'Inter-object spacing:'
+    assert not widget._width_row_label.isHidden()
+    assert not widget._width_label.isHidden()
+
+    # Drive a completed run (raw peak = 5.0 vox) and check both values.
+    _fake_completed_run(widget, mode_text=_MODE_DILATION)
+    assert widget._radius_label.text() == '5.00 vox'  # raw peak (half)
+    assert widget._width_label.text() == '10.00 vox'  # 2x = full spacing
 
 
 def test_run_with_same_layer_for_seg_and_container_shows_error(

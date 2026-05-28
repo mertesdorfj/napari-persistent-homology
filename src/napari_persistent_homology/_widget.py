@@ -24,8 +24,8 @@ Architecture
    any thread without locking.
 4. When the worker finishes, '_on_result' converts the subpixel-step
    measurements to voxel units (and to nm / µm if a voxel pitch was set),
-   updates the plot and the result labels, and enables the "Save Results…"
-   button.
+   updates the plot and the result labels, and enables the two save buttons
+   ("Save Results" and "Save Curve & Plot").
 """
 
 import csv
@@ -509,9 +509,10 @@ class PersistentHomologyWidget(QWidget):
         stats_group.setLayout(stats_form)
 
         # Row labels are kept as instance attributes because their text
-        # changes between modes (erosion shows a radius, dilation an
-        # inter-object spacing) and because the width row is hidden
-        # entirely in dilation modes.
+        # changes between modes: the first row is the raw peak (erosion
+        # 'Radius / half-thickness', dilation 'Half-spacing') and the second
+        # is twice that (erosion 'Width / thickness', dilation 'Inter-object
+        # spacing'). Both rows are shown in every mode; only the text differs.
         self._radius_row_label = QLabel('Radius / half-thickness (erosion):')
         self._width_row_label = QLabel('Width / thickness:')
         self._radius_label = QLabel('—')
@@ -650,17 +651,21 @@ class PersistentHomologyWidget(QWidget):
         self._save_btn.setEnabled(False)
         self._save_curve_btn.setEnabled(False)
 
+        # Both rows are shown in every mode. The first row is always the raw
+        # peak location (a half-quantity per the paper); the second row is
+        # exactly twice that — the full geometric size. Erosion: half-thickness
+        # / full thickness; dilation: half-spacing / full inter-object spacing.
         mode_key = _MODE_KEY[self._mode_combo.currentText()]
         if mode_key == 'erosion':
             self._radius_row_label.setText(
                 'Radius / half-thickness (erosion):'
             )
-            self._width_row_label.setVisible(True)
-            self._width_label.setVisible(True)
+            self._width_row_label.setText('Width / thickness:')
         else:
-            self._radius_row_label.setText('Inter-object spacing:')
-            self._width_row_label.setVisible(False)
-            self._width_label.setVisible(False)
+            self._radius_row_label.setText('Half-spacing:')
+            self._width_row_label.setText('Inter-object spacing:')
+        self._width_row_label.setVisible(True)
+        self._width_label.setVisible(True)
 
         self._ax.clear()
         self._ax.text(
@@ -895,8 +900,10 @@ class PersistentHomologyWidget(QWidget):
 
         unit = p['unit']
 
-        # Width / thickness is just twice the radius — full diameter for
-        # cylindrical objects, full thickness for sheet-like structures.
+        # The second result row is always twice the raw peak. In erosion that
+        # is the full diameter / thickness; in dilation it is the full
+        # inter-object spacing (the peak itself is a half-distance — see the
+        # paper's Fig. 3 caption and the Persistent Homology methods section).
         width_vox = 2.0 * radius_vox
 
         if unit != 'vox' and min(p['vx'], p['vy'], p['vz']) > 0:
@@ -927,10 +934,11 @@ class PersistentHomologyWidget(QWidget):
         self._fwhm_label.setText(fwhm_str)
 
         # Mode-dependent labels — used both for the completion status
-        # message and for the plot's axis / peak annotations.
+        # message and for the plot's axis / peak annotations. The peak label
+        # names the raw-peak quantity (a half-quantity per the paper).
         #   erosion             → object-count curve, peak ≈ radius
-        #   dilation            → hole-count curve, peak ≈ inter-object spacing
-        #   dilation_internal   → hole-count curve, peak ≈ internal spacing
+        #   dilation            → hole-count curve, peak ≈ half-spacing
+        #   dilation_internal   → hole-count curve, peak ≈ half-spacing
         mode_key = _MODE_KEY[p['mode']]
         if mode_key == 'erosion':
             analysis_name = 'Object radius / half-thickness'
@@ -939,12 +947,12 @@ class PersistentHomologyWidget(QWidget):
             y_axis_label = 'Object count'
         elif mode_key == 'dilation':
             analysis_name = 'Object spacing'
-            peak_label = 'Max / spacing'
+            peak_label = 'Max / half-spacing'
             x_axis_label = 'Dilation round'
             y_axis_label = 'Hole count'
         else:  # "dilation_internal"
             analysis_name = 'Internal spacing'
-            peak_label = 'Max / spacing'
+            peak_label = 'Max / half-spacing'
             x_axis_label = 'Dilation round'
             y_axis_label = 'Hole count'
 
@@ -1123,9 +1131,8 @@ class PersistentHomologyWidget(QWidget):
         # Metric labels mirror the GUI row labels but drop the trailing
         # '(erosion)' qualifier — the mode is already on the '# Mode:'
         # line in the header, so repeating it here would be redundant.
-        # The width row only exists in erosion mode (the GUI hides it in
-        # the dilation modes because doubling a spacing has no clean
-        # physical meaning).
+        # Both modes report the raw peak (a half-quantity) and twice that
+        # (the full geometric size), matching the two GUI result rows.
         mode_key = _MODE_KEY[p['mode']]
         if mode_key == 'erosion':
             metrics = [
@@ -1135,11 +1142,14 @@ class PersistentHomologyWidget(QWidget):
             ]
         else:
             metrics = [
-                ('Inter-object spacing', radius_vox),
+                ('Half-spacing', radius_vox),
+                ('Inter-object spacing', width_vox),
                 ('Full-width at half-maximum', fwhm_vox),
             ]
 
-        with open(path, 'w', newline='', encoding='utf-8') as f:
+        # utf-8-sig writes a BOM so Excel on Windows auto-detects UTF-8 and
+        # renders the em dash / 'µm' correctly instead of mojibake ('â€”').
+        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
             w = csv.writer(f)
             w.writerow(['# napari-persistent-homology — Summary Results'])
             has_physical = self._write_metadata_header(w, p)
@@ -1184,7 +1194,7 @@ class PersistentHomologyWidget(QWidget):
           extension is stripped first so the two siblings share a base.
         - The CSV contains the same metadata header as the summary file
           (mode + parameters + voxel size) plus three columns:
-          'step', 'count_raw', 'count_smoothed'.
+          'Erosion_round' / 'Dilation_round', 'Count_raw', 'Count_smoothed'.
         - The PNG is the current matplotlib figure rendered at 150 DPI
           with tight bounding box.
 
@@ -1224,7 +1234,8 @@ class PersistentHomologyWidget(QWidget):
             curve_title = '# napari-persistent-homology — Hole Count Curve'
             round_column = 'Dilation_round'
 
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        # utf-8-sig (BOM) so Excel on Windows decodes UTF-8 correctly.
+        with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
             w = csv.writer(f)
             w.writerow([curve_title])
             self._write_metadata_header(w, p, note_voxel_size_when_unset=False)

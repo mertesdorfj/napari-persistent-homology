@@ -4,18 +4,22 @@ Subpixel morphological dilation and erosion in 2D and 3D.
 Classical binary morphology operates one voxel at a time, which is too coarse
 for accurate shape measurements at the scale of a few voxels. This module
 implements subpixel-accurate dilation and erosion by evolving the level-set
-PDE  dU/dt = ±|grad U|  with the Rouy–Tourin upwind finite-difference scheme.
-Running the evolution for time 't' with step 'Lambda < 1' produces an
-operation equivalent to dilating / eroding by 't' voxel-lengths but with
-fractional-voxel accuracy.
+PDE  dU/dt = ±|grad U|  with a first-order Osher–Sethian upwind
+finite-difference scheme (paper eqs. 3–6). Running the evolution for time 't'
+with step 'Lambda < 1' produces an operation equivalent to dilating / eroding
+by 't' voxel-lengths but with fractional-voxel accuracy. With 'Lambda = 0.1',
+ten steps equal one full round of standard morphology, i.e. one voxel layer
+added (dilation) or removed (erosion).
 
 Used by 'ph_functions.persistent_homology_erosion' /
 'persistent_homology_dilation' to drive the morphological evolution between
 counting steps.
 
 Source: Wang, Østergaard, Hasselholt, Sporring,
-"Extracting Mitochondrial Cristae Characteristics from 3D Focused Ion Beam
-Scanning Electron Microscopy Data", https://doi.org/10.1101/2022.11.08.515664
+"A semi-automatic method for extracting mitochondrial cristae characteristics
+from 3D focused ion beam scanning electron microscopy data",
+Communications Biology 7:377 (2024),
+https://doi.org/10.1038/s42003-024-06045-4
 """
 
 import numpy as np
@@ -74,14 +78,15 @@ def U_km1(U):
 
 
 ##############################################################################
-# Subpixel dilation / erosion (Rouy–Tourin upwind scheme)
+# Subpixel dilation / erosion (Osher–Sethian upwind scheme)
 #
 # Each routine integrates the Hamilton–Jacobi equation  dU/dt = ±|grad U|  for
 # time 't', using sub-voxel time steps of size 'Lambda'. The gradient
 # magnitude is approximated by the upwind formula that uses only neighbour
 # differences in the direction the front is moving (positive parts for
-# dilation, negative parts for erosion). U is clipped to [0, 1] after each
-# step so it stays a valid soft indicator of the object.
+# dilation, negative parts for erosion). This is the 3D form of the paper's
+# eqs. 3 (dilation) and 5 (erosion). U is clipped to [0, 1] after each step
+# (paper eqs. 4 and 6) so it stays a valid soft indicator of the object.
 #
 # Parameters (common to all four functions):
 #   volume: ndarray, shape (H, W) or (H, W, D)
