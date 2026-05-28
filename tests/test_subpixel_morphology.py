@@ -100,10 +100,85 @@ class TestSubpixelErosion3D:
 
 
 class TestDilationErosionInverse:
-    def test_dilate_then_erode_preserves_interior(self):
-        # After dilation + erosion with the same t, the deep interior should
-        # still be close to 1 (not a perfect inverse but should hold for interior)
+    """
+    Tests for the morphological closing: dilate then erode by the same t.
+
+    For a solid blob with no holes, closing should approximately recover the
+    original shape. Because this is a finite-difference upwind PDE scheme
+    (not exact set-theoretic morphology), the recovery is approximate —
+    boundary-zone voxels retain some numerical diffusion. The tests below
+    check the *direction* of the effect at multiple sample points rather
+    than insisting on a perfect identity.
+    """
+
+    # Sample points grouped by which region they occupy.
+    # Cube spans indices 5..14 on every axis (slice(5, 15)).
+    DEEP_INTERIOR = [(10, 10, 10), (8, 11, 9), (9, 9, 9)]
+    ORIG_BOUNDARY_FACE = [(5, 10, 10), (14, 10, 10), (10, 5, 10), (10, 10, 14)]
+    JUST_OUTSIDE_FACE = [(4, 10, 10), (15, 10, 10), (10, 4, 10), (10, 10, 15)]
+    FAR_BACKGROUND = [(0, 0, 0), (19, 19, 19), (0, 19, 0)]
+
+    def test_dilation_intermediate_state(self):
+        """
+        After dilation only: interior stays 1, just-outside voxels
+        gain value, and far-background voxels stay 0.
+        """
+        vol = solid_cube(size=20, blob_slice=slice(5, 15))
+        dilated = subpixel_dilation_3D(vol, t=0.5, Lambda=0.1)
+
+        for p in self.DEEP_INTERIOR:
+            assert dilated[p] == pytest.approx(1.0, abs=0.05), (
+                f'interior {p} should remain ~1.0 after dilation '
+                f'(got {dilated[p]:.3f})'
+            )
+        for p in self.JUST_OUTSIDE_FACE:
+            assert dilated[p] > 0.2, (
+                f'dilation should activate just-outside voxel {p} '
+                f'(got {dilated[p]:.3f})'
+            )
+        for p in self.FAR_BACKGROUND:
+            assert dilated[p] == pytest.approx(0.0, abs=1e-3), (
+                f'far-background {p} should stay ~0 after dilation '
+                f'(got {dilated[p]:.3f})'
+            )
+
+    def test_closing_recovers_shape_approximately(self):
+        """
+        After dilation + erosion (closing): interior stays high,
+        far-background stays zero, and the just-outside voxels that
+        dilation activated come back down toward zero.
+        """
         vol = solid_cube(size=20, blob_slice=slice(5, 15))
         dilated = subpixel_dilation_3D(vol, t=0.5, Lambda=0.1)
         recovered = subpixel_erosion_3D(dilated, t=0.5, Lambda=0.1)
-        assert recovered[10, 10, 10] > 0.9
+
+        # Deep interior should remain near 1.0
+        for p in self.DEEP_INTERIOR:
+            assert recovered[p] > 0.9, (
+                f'closing eroded interior {p} too much '
+                f'(got {recovered[p]:.3f})'
+            )
+
+        # Original boundary loses some value due to numerical diffusion,
+        # but should still be clearly in the foreground (> 0.5)
+        for p in self.ORIG_BOUNDARY_FACE:
+            assert recovered[p] > 0.5, (
+                f'closing eroded original boundary {p} below 0.5 '
+                f'(got {recovered[p]:.3f})'
+            )
+
+        # Just-outside voxels: erosion must reduce them (recovery direction).
+        # They don't quite return to 0 due to numerical diffusion — but they
+        # must clearly be lower than the post-dilation value.
+        for p in self.JUST_OUTSIDE_FACE:
+            assert recovered[p] < dilated[p] - 0.1, (
+                f'erosion should reduce just-outside {p} '
+                f'(dilated={dilated[p]:.3f}, recovered={recovered[p]:.3f})'
+            )
+
+        # Far background must stay essentially zero throughout
+        for p in self.FAR_BACKGROUND:
+            assert recovered[p] == pytest.approx(0.0, abs=1e-3), (
+                f'far-background {p} drifted from 0 after closing '
+                f'(got {recovered[p]:.3f})'
+            )

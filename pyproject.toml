@@ -73,7 +73,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-"*" = ["*.yaml"]
+"*" = ["*.yaml", "data/*.npy"]
 
 [tool.setuptools_scm]
 write_to = "src/napari_persistent_homology/_version.py"
@@ -84,6 +84,12 @@ minversion = "6.0"
 addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 # filterwarnings = ["error"]  # recommended by PP309; deprecation warnings cause failures so leaving for the user to enable if desired
+filterwarnings = [
+    # Third-party deprecation: napari's own pydantic models still use the
+    # deprecated 'json_encoders' config. Not fixable here; silence it so our
+    # test output stays clean. Remove once napari/pydantic stop emitting it.
+    "ignore:.*json_encoders.* is deprecated:DeprecationWarning",
+]
 log_cli_level = "INFO"
 testpaths = ["tests"]
 

@@ -1,12 +1,32 @@
 """
-Extracting Mitochondrial Cristae Characteristics from 3D Focused Ion Beam Scanning Electron Microscopy Data
+Persistent-homology analysis of 3D binary segmentations.
 
-Chenhao Wang, Leif Østergaard, Stine Hasselholt, Jon Sporring
+This module is the analysis core of the plugin. It iteratively erodes or
+dilates a binary volume by subpixel amounts (using
+'subpixel_morphology.subpixel_*_3D'), counts how many connected components
+and topological holes survive at each step, and extracts shape descriptors
+(radius, FWHM) from the resulting count curves.
 
-https://doi.org/10.1101/2022.11.08.515664
+Three analysis modes:
+* Function 'persistent_homology_erosion' — repeatedly shrinks the object;
+  the object-count curve peaks at the typical half-thickness / radius.
+* Function 'persistent_homology_dilation' — repeatedly grows the object;
+  the hole-count curve peaks at the typical inter-object spacing.
+* Function 'persistent_homology_dilation_internal_object' — same as dilation
+  but the count is restricted to a container mask, for measuring spacing of
+  objects inside a parent compartment (e.g. cristae inside a mitochondrion).
+
+Each routine returns '(object_count_curve, hole_count_curve)'. The relevant
+curve is then passed through function 'compute_homology_stats', which Gaussian-
+smooths it and reports the peak location and full-width-at-half-maximum. Raw
+peak/FWHM values are in subpixel-step units — divide by 'ceil(1 / Lambda)'
+to convert to voxel units.
+
+Source: Wang, Østergaard, Hasselholt, Sporring,
+"Extracting Mitochondrial Cristae Characteristics from 3D Focused Ion Beam
+Scanning Electron Microscopy Data", https://doi.org/10.1101/2022.11.08.515664
 """
 
-# Imports
 import os
 
 import cc3d
@@ -16,16 +36,36 @@ import scipy
 from scipy import stats
 from tqdm import tqdm
 
-from .subpixel_morphology import (
-    subpixel_dilation_3D,
-    subpixel_erosion_3D,
-)
+from .subpixel_morphology import subpixel_dilation_3D, subpixel_erosion_3D
 
-###########################################################################################
-# counting algorithm for objects and holes within a binary image volume
+##############################################################################
+# Counting components and holes
+#
+# Wrappers around 'cc3d.connected_components' that count either foreground
+# components ("objects") or background components inside the volume ("holes").
+# All three are called inside the persistent-homology loop after every
+# subpixel morphology step.
+##############################################################################
 
 
 def object_count(volume_to_count, connectivity=8):
+    """
+    Count connected foreground components in a 3D binary volume.
+
+    Parameters
+    ----------
+    volume_to_count: ndarray
+        Binary 3D array (0 = background, non-zero = foreground).
+    connectivity: int, optional
+        Connectivity for 3D component labelling (6, 18, or 26). Default 8 is
+        the 2D value and is silently treated as 6 in 3D by 'cc3d'; the
+        plugin always passes 26 (full 3D neighbourhood).
+
+    Returns
+    -------
+    int
+        Number of distinct foreground components.
+    """
     object_num = cc3d.connected_components(
         volume_to_count, connectivity=connectivity
     ).max()
@@ -34,10 +74,25 @@ def object_count(volume_to_count, connectivity=8):
 
 def hole_count(volume_to_count, connectivity=8):
     """
-    always subtracts by 1 at the end because the background makes up 1 connected_component,
-    after inversing the volume with holes.
-    """
+    Count connected background components ("holes") in a 3D binary volume.
 
+    Inverts the binary volume and counts connected components of the
+    background. The outer background is one such component, so the final
+    count is decremented by 1 — what is returned is therefore the number of
+    enclosed holes only.
+
+    Parameters
+    ----------
+    volume_to_count: ndarray
+        Binary 3D array (0 = background, non-zero = foreground).
+    connectivity: int, optional
+        See function 'object_count'.
+
+    Returns
+    -------
+    int
+        Number of enclosed holes (background components minus the outer one).
+    """
     total_holes = np.ones(volume_to_count.shape).astype(
         np.uint8
     ) - volume_to_count.astype(np.uint8)
@@ -52,7 +107,26 @@ def holes_count_internal_object(
     internal_object, container_object, connectivity=8
 ):
     """
-    for use with measurement of internal objects
+    Count holes of an internal object, restricted to a container mask.
+
+    Used by the "internal-spacing" analysis mode. The internal object is
+    first masked by the container (voxels outside the container are dropped),
+    then the holes of the resulting volume are counted as in function
+    'hole_count'. The decrement by 1 again removes the outer background component.
+
+    Parameters
+    ----------
+    internal_object: ndarray
+        Binary 3D mask of the internal structures.
+    container_object: ndarray
+        Binary 3D mask of the parent compartment. Same shape as 'internal_object'.
+    connectivity: int, optional
+        See function 'object_count'.
+
+    Returns
+    -------
+    int
+        Number of enclosed holes inside the container.
     """
     internal_object_filtered = internal_object * container_object
     total_holes = np.ones(internal_object_filtered.shape).astype(
@@ -65,16 +139,56 @@ def holes_count_internal_object(
     return hole_num - 1
 
 
-###########################################################################################
-# persistent homology functions
+##############################################################################
+# Persistent-homology analysis functions
+#
+# All three analysis functions share the same skeleton:
+#   1. Pad the input volume by 'max_steps * Lambda' voxels on each side so
+#      morphological evolution never touches the boundary.
+#   2. Record the initial object/hole counts at step 0.
+#   3. Repeat 'max_steps' times: apply one subpixel dilation/erosion step
+#      of size 'Lambda' voxels, binarise the result at 0.5, and count
+#      objects and holes on the binarised volume.
+#   4. Every '5 * ceil(1/Lambda)' steps, reset the working volume to its
+#      binarised form to prevent numerical drift in the float field.
+#
+# Parameters (common to all three analysis functions):
+#   segmented_object_volume: ndarray
+#       Input 3D binary mask.
+#   max_steps: int
+#       Total number of subpixel morphology steps. Maximum measurable
+#       distance is 'max_steps * Lambda' voxels.
+#   Lambda: float
+#       Subpixel step size in voxel-length units (0.1 = 10 steps per voxel).
+#       Smaller = more accurate, but slower.
+#   Connectivity: int
+#       3D neighbour connectivity used by the component counters (6/18/26).
+#   step_callback: callable, optional
+#       If given, called as 'step_callback(current_step, max_steps)' after
+#       each iteration — used by the widget to drive a progress bar.
+#
+# Returns:
+#   (object_count_curve, hole_count_curve) — both 'ndarray' of length
+#   'max_steps + 1' (index 0 is the initial state).
+##############################################################################
 
 
 def persistent_homology_dilation(
-    segmented_object_volume, max_steps=100, Lambda=0.1, Connectivity=26
+    segmented_object_volume,
+    max_steps=100,
+    Lambda=0.1,
+    Connectivity=26,
+    step_callback=None,
 ):
     """
-    Dilation version, returns the count curves for both objects and holes,
-    but usually we only use the count curve for holes.
+    Iteratively dilate a binary volume and track object/hole counts.
+
+    Used for object-spacing analysis: as the object grows, neighbouring
+    regions merge and the surrounding holes close up. The peak of the
+    returned hole-count curve corresponds to the characteristic spacing
+    between objects.
+
+    See the section header above for parameter and return-value details.
     """
 
     t = Lambda
@@ -151,6 +265,9 @@ def persistent_homology_dilation(
                 segmented_object_volume_padded_dilated_binarized
             )
 
+        if step_callback is not None:
+            step_callback(step + 1, max_steps)
+
     return np.array(object_count_result), np.array(hole_count_result)
 
 
@@ -160,11 +277,25 @@ def persistent_homology_dilation_internal_object(
     max_steps=100,
     Lambda=0.1,
     Connectivity=26,
+    step_callback=None,
 ):
     """
-    Dilation version for measurement of internal objects contained within other objects,
-    returns the count curves for both objects and holes,
-    but usually we only use the count curve for holes.
+    Dilation with hole counting restricted to a container mask.
+
+    Variant of function 'persistent_homology_dilation' for the internal-spacing
+    mode: useful when the structures of interest are contained inside a parent
+    compartment (e.g. cristae inside a mitochondrion). At every step the hole
+    count is computed only inside 'container_object_volume' so that background
+    voxels outside the container do not contribute.
+
+    Parameters
+    ----------
+    segmented_object_volume: ndarray
+        Binary 3D mask of the internal structures.
+    container_object_volume: ndarray
+        Binary 3D mask of the parent compartment. Same shape as 'segmented_object_volume'.
+
+    Other parameters and return value are as in function 'persistent_homology_dilation'.
     """
 
     t = Lambda
@@ -260,15 +391,29 @@ def persistent_homology_dilation_internal_object(
                 segmented_object_volume_padded_dilated_binarized
             )
 
+        if step_callback is not None:
+            step_callback(step + 1, max_steps)
+
     return np.array(object_count_result), np.array(hole_count_result)
 
 
 def persistent_homology_erosion(
-    segmented_object_volume, max_steps=100, Lambda=0.1, Connectivity=26
+    segmented_object_volume,
+    max_steps=100,
+    Lambda=0.1,
+    Connectivity=26,
+    step_callback=None,
 ):
     """
-    Erosion version, returns the count curves for both objects and holes,
-    but usually we only use the count curve for objects.
+    Iteratively erode a binary volume and track object/hole counts.
+
+    Used for object-radius / half-thickness analysis: as the object shrinks,
+    thinner regions disappear first and the foreground splits into more
+    components before vanishing. The peak of the returned object-count curve
+    corresponds to the characteristic half-thickness (radius) of the
+    structure; its FWHM measures surface roughness / curvature.
+
+    See the section header above for parameter and return-value details.
     """
 
     t = Lambda
@@ -345,23 +490,44 @@ def persistent_homology_erosion(
                 segmented_object_volume_padded_eroded_binarized
             )
 
+        if step_callback is not None:
+            step_callback(step + 1, max_steps)
+
     return np.array(object_count_result), np.array(hole_count_result)
 
 
-###########################################################################################
-# feature extraction from count curves and performing statistics
+##############################################################################
+# Feature extraction from count curves
+#
+# Given a count curve produced by one of the persistent-homology analysis functions
+# above, these routines smooth the curve and extract the peak location and
+# full-width-at-half-maximum (FWHM). Peak location is interpreted as
+# radius / spacing (in subpixel-step units); FWHM measures the spread of
+# the distribution of feature sizes.
+##############################################################################
 
 
 def moving_average(x, w):
+    """Simple moving-average filter of window size 'w' (valid mode)."""
     return np.convolve(x, np.ones(w), 'valid') / w
 
 
 def gaussian_average(x, sigma=1):
+    """1D Gaussian smoothing of a curve with the given 'sigma'."""
     return scipy.ndimage.gaussian_filter1d(x, sigma=sigma)
 
 
 def find_max_location(series, offset=5):
-    # finds argmax considering the offset
+    """
+    Index of the last occurrence of the maximum of 'series[offset:]'.
+
+    The initial 'offset' samples are skipped to ignore the count-curve
+    artifact near step 0 (the original binary volume is not yet smoothed).
+    When several samples share the maximum value, the right-most one is
+    returned — this matches the convention used in the original paper for
+    locating the radius peak. If the whole post-offset series is zero, the
+    function returns 'offset' as a fallback.
+    """
     if np.max(series[offset:]) == 0:
         max_loc = 0 + 5
     else:
@@ -376,7 +542,14 @@ def find_max_location(series, offset=5):
 
 
 def compute_FWHM(series, offset=5):
+    """
+    Full-width at half-maximum of a count curve, around its peak.
 
+    Finds the peak via function 'find_max_location', then walks outward to the
+    contiguous block of samples that lie at or above half-maximum and
+    returns 'right_index - left_index'. Result is in step units; divide by
+    'ceil(1 / Lambda)' to convert to voxels.
+    """
     max_location = find_max_location(series, offset=offset)
     maximum_count = series[max_location]
     half_maximum = maximum_count / 2
@@ -390,6 +563,9 @@ def compute_FWHM(series, offset=5):
         np.where(max_location <= indices_larger_than_half_max)
     ]
 
+    # Keep only the contiguous run of above-half-max samples that contains the
+    # peak (np.split breaks the index list wherever consecutive indices are
+    # not adjacent).
     try:
         left_index = np.split(
             left_half, np.where(np.diff(left_half) != 1)[0] + 1
@@ -409,12 +585,25 @@ def compute_FWHM(series, offset=5):
 
 def compute_homology_stats(series_of_series, offset=5, SIGMA=5):
     """
-    window = 0 or 1 is no filter
-    window > 1 is moving average with the specified window size.
+    Smooth one or more count curves and extract peak + FWHM statistics.
 
-    output is a list containing [FWHM_collection,
-                                 maximum_count_collection,
-                                 max_location_collection]
+    Parameters
+    ----------
+    series_of_series: sequence of ndarray
+        One or more count curves (typically one per analysed object).
+    offset: int, optional
+        Initial samples to skip when locating the peak (passes through to
+        functions 'find_max_location' / 'compute_FWHM'). Default = 5.
+    SIGMA: float, optional
+        Gaussian smoothing sigma applied to each curve before feature
+        extraction. Default = 5.
+
+    Returns
+    -------
+    ndarray, shape (3, N)
+        Stacked statistics in the order [FWHM, maximum_count, max_location],
+        with one column per input curve. Values for FWHM and max_location
+        are in step units.
     """
     FWHM_collection = []
     max_location_collection = []
@@ -440,6 +629,15 @@ def compute_homology_stats(series_of_series, offset=5, SIGMA=5):
     return output
 
 
+##############################################################################
+# Plotting and batch-analysis helpers (from the original research code)
+#
+# These functions are not used by the napari widget itself — they are kept
+# for reproducing the figures in the paper or run the pipeline as a script
+# on many segmentations at once.
+##############################################################################
+
+
 def plot_hist_fixed_width_save(
     x_data,
     drop_outlier_percentile_lower,
@@ -459,7 +657,15 @@ def plot_hist_fixed_width_save(
     axis_font=18,
     legend_font=16,
 ):
+    """
+    Plot a histogram with mean/median/std/MAD annotation and save to disk.
 
+    Trims the lower 'drop_outlier_percentile_lower' and the upper
+    '1 - drop_outlier_percentile_upper' tails of 'x_data' before
+    plotting. If 'bin_count' is given it is used directly; otherwise the
+    bin edges are built from 'bin_min', 'bin_max', and 'binwidth'.
+    The figure is saved as 'save_folder/save_name' and also returned.
+    """
     x_mean = np.round(np.mean(x_data), 1)
     x_median = np.round(np.median(x_data), 1)
     x_std = np.round(np.std(x_data), 1)
@@ -539,7 +745,13 @@ def plot_scatter(
     axis_font=18,
     legend_font=16,
 ):
+    """
+    Scatter plot 'y_data' vs 'x_data' with Pearson correlation annotation.
 
+    The Pearson coefficient, its p-value, and the sample size are written into
+    the figure. The image is saved as 'save_folder/(main_label + '.png')'
+    and the figure object is also returned.
+    """
     pearson_score, p_val = np.round(scipy.stats.pearsonr(x_data, y_data), 4)
     text = 'pearson = ' + str(pearson_score) + '\n' + 'p_value = ' + str(p_val)
     text = text + '\n' + 'sample_size = ' + str(len(x_data))
@@ -557,7 +769,20 @@ def plot_scatter(
 
 
 def find_boundary_mitochondria_id(img_volume, seg_volume):
+    """
+    Identify segmented objects that touch the image-volume boundary.
 
+    Builds a thin mask near the edge of the imaged region (voxels where
+    'img_volume == 0' dilated by 3) and looks up which connected
+    components of 'seg_volume' overlap it. Used to exclude
+    boundary-truncated mitochondria from batch shape statistics, since
+    their measured shape descriptors would be unreliable.
+
+    Returns
+    -------
+    ndarray
+        Unique segmentation IDs that touch the imaged-region boundary.
+    """
     out_of_bounds_volume = img_volume == 0
 
     out_of_bounds_volume = scipy.ndimage.morphology.binary_dilation(
@@ -578,7 +803,15 @@ def find_boundary_mitochondria_id(img_volume, seg_volume):
 
 
 def plot_all_curves(results, sigma, destination_path):
+    """
+    Save one annotated count-curve figure per entry in 'results'.
 
+    Iterates over the count curves in 'results', smooths each with the
+    given 'sigma', marks the peak and the FWHM half-maximum endpoints in
+    red, and saves the figure as 'destination_path / "mito id = i.png"'.
+    Intended for batch inspection of many segmentations after a scripted
+    analysis run.
+    """
     for i in tqdm(range(len(results))):
         curve = results[i]
         curve_smooth = gaussian_average(curve, sigma=sigma)

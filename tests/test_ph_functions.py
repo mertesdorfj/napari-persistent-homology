@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from napari_persistent_homology.ph_functions import (
     compute_FWHM,
@@ -9,6 +10,7 @@ from napari_persistent_homology.ph_functions import (
     holes_count_internal_object,
     object_count,
     persistent_homology_dilation,
+    persistent_homology_dilation_internal_object,
     persistent_homology_erosion,
 )
 
@@ -69,6 +71,34 @@ class TestHoleCount:
         vol = np.zeros((10, 10, 10), dtype=np.uint8)
         assert hole_count(vol, connectivity=26) == 0
 
+    def test_hollow_shell_has_one_hole(self):
+        # Cube with an enclosed empty cavity inside → exactly 1 hole.
+        # Outer shell at indices 2..11, inner cavity at indices 4..9.
+        # The volume is padded with background so an "outer" component
+        # exists and the -1 correction in hole_count is meaningful.
+        vol = np.zeros((14, 14, 14), dtype=np.uint8)
+        vol[2:12, 2:12, 2:12] = 1
+        vol[4:10, 4:10, 4:10] = 0
+        assert hole_count(vol, connectivity=26) == 1
+
+    def test_solid_with_two_cavities_has_two_holes(self):
+        # One solid block with two separate empty pockets inside.
+        # Each pocket is its own enclosed background component → 2 holes.
+        vol = np.zeros((14, 14, 14), dtype=np.uint8)
+        vol[2:12, 2:12, 2:12] = 1
+        vol[3:5, 3:5, 3:5] = 0
+        vol[8:10, 8:10, 8:10] = 0
+        assert hole_count(vol, connectivity=26) == 2
+
+    def test_two_separate_hollow_shells_have_two_holes(self):
+        # Two distant hollow shells, each contributing one cavity → 2 holes total
+        vol = np.zeros((20, 20, 20), dtype=np.uint8)
+        vol[1:7, 1:7, 1:7] = 1
+        vol[3:5, 3:5, 3:5] = 0
+        vol[12:18, 12:18, 12:18] = 1
+        vol[14:16, 14:16, 14:16] = 0
+        assert hole_count(vol, connectivity=26) == 2
+
 
 # ---------------------------------------------------------------------------
 # holes_count_internal_object
@@ -85,6 +115,45 @@ class TestHolesCountInternalObject:
         internal = np.zeros_like(blob)
         assert (
             holes_count_internal_object(internal, blob, connectivity=26) == 0
+        )
+
+    def test_one_interior_gap_is_one_hole(self):
+        # Container is a solid cube; internal fills it except for one
+        # interior voxel. The gap is fully enclosed by foreground (none of
+        # its neighbours are background outside the container), so it
+        # counts as one hole.
+        container = np.zeros((14, 14, 14), dtype=np.uint8)
+        container[2:12, 2:12, 2:12] = 1
+        internal = container.copy()
+        internal[5, 5, 5] = 0
+        assert (
+            holes_count_internal_object(internal, container, connectivity=26)
+            == 1
+        )
+
+    def test_two_interior_gaps_are_two_holes(self):
+        # Two interior gaps, well separated → 2 holes
+        container = np.zeros((14, 14, 14), dtype=np.uint8)
+        container[2:12, 2:12, 2:12] = 1
+        internal = container.copy()
+        internal[4, 4, 4] = 0
+        internal[9, 9, 9] = 0
+        assert (
+            holes_count_internal_object(internal, container, connectivity=26)
+            == 2
+        )
+
+    def test_gap_at_container_boundary_is_not_a_hole(self):
+        # A gap touching the surface of the container connects to the outer
+        # background (which is also 0 because internal × container = 0
+        # outside the container) — so it is not a topological hole.
+        container = np.zeros((14, 14, 14), dtype=np.uint8)
+        container[2:12, 2:12, 2:12] = 1
+        internal = container.copy()
+        internal[2, 5, 5] = 0  # at index 2 = the container's surface
+        assert (
+            holes_count_internal_object(internal, container, connectivity=26)
+            == 0
         )
 
 
@@ -154,7 +223,7 @@ class TestComputeFWHM:
         # Gaussian with sigma=5 has FWHM ≈ 11.77; expect within ±3
         series = gaussian_peak(length=100, centre=50, sigma=5)
         fwhm = compute_FWHM(series, offset=5)
-        assert 8 <= fwhm <= 16
+        assert 8 <= fwhm <= 15
 
     def test_narrow_peak_has_smaller_fwhm(self):
         wide = gaussian_peak(length=100, centre=50, sigma=8)
@@ -185,6 +254,52 @@ class TestComputeHomologyStats:
         series = gaussian_peak(length=100, centre=50, sigma=5)
         result = compute_homology_stats([series], offset=5, SIGMA=2)
         assert result[0, 0] > 0
+
+    def test_max_count_reflects_peak_amplitude(self):
+        # A unit-amplitude Gaussian smoothed by SIGMA=2 should retain most
+        # of its peak height. Analytical: smoothing a Gaussian (sigma=5) by
+        # SIGMA=2 produces an effective sigma of sqrt(5² + 2²) ≈ 5.39, so
+        # the peak amplitude scales by 5/5.39 ≈ 0.93.
+        series = gaussian_peak(length=100, centre=50, sigma=5)
+        result = compute_homology_stats([series], offset=5, SIGMA=2)
+        max_count = result[1, 0]
+        assert 0.85 < max_count <= 1.0
+
+    def test_max_count_scales_linearly_with_input(self):
+        # Doubling the input amplitude must double the reported max_count
+        # (smoothing is linear). Guards against any normalisation creeping
+        # into the smoothing or peak-reading code path.
+        s1 = gaussian_peak(length=100, centre=50, sigma=5)
+        s2 = 2.0 * s1
+        result = compute_homology_stats([s1, s2], offset=5, SIGMA=2)
+        assert result[1, 1] == pytest.approx(2 * result[1, 0], rel=0.01)
+
+    def test_fwhm_quantitative_for_known_gaussian(self):
+        # Gaussian with sigma=5 has analytical FWHM = 2σ√(2 ln 2) ≈ 11.77.
+        # With minimal smoothing (SIGMA=1), the function should recover a
+        # value within ±4 of that.
+        series = gaussian_peak(length=100, centre=50, sigma=5)
+        result = compute_homology_stats([series], offset=5, SIGMA=1)
+        fwhm = result[0, 0]
+        assert 8 <= fwhm <= 16
+
+    def test_fwhm_ordering_two_series(self):
+        # A narrower input must yield a smaller FWHM, in the same call.
+        # Locks the per-series independence of the FWHM row.
+        narrow = gaussian_peak(length=100, centre=50, sigma=3)
+        wide = gaussian_peak(length=100, centre=50, sigma=8)
+        result = compute_homology_stats([narrow, wide], offset=5, SIGMA=1)
+        assert result[0, 0] < result[0, 1]
+
+    def test_per_series_stats_are_independent(self):
+        # Two peaks at different positions must produce independent
+        # max_locations — confirms the function processes each input
+        # series separately rather than accidentally mixing them.
+        s1 = gaussian_peak(length=100, centre=30, sigma=4)
+        s2 = gaussian_peak(length=100, centre=60, sigma=4)
+        result = compute_homology_stats([s1, s2], offset=5, SIGMA=1)
+        assert abs(result[2, 0] - 30) <= 5
+        assert abs(result[2, 1] - 60) <= 5
 
 
 # ---------------------------------------------------------------------------
@@ -245,17 +360,69 @@ class TestPersistentHomologyDilation:
     def test_objects_merge_during_dilation(self):
         # Two blobs close enough together should merge; count goes from 2 → 1
         vol = np.zeros((20, 20, 20), dtype=np.uint8)
-        vol[2:5, 9:11, 9:11] = 1  # blob 1
-        vol[15:18, 9:11, 9:11] = (
-            1  # blob 2 — far apart, won't merge in few steps
-        )
-
-        # Use blobs that ARE close so they do merge
-        vol2 = np.zeros((20, 20, 20), dtype=np.uint8)
-        vol2[8:10, 9:11, 9:11] = 1  # blob 1
-        vol2[12:14, 9:11, 9:11] = 1  # blob 2 — 2 voxels apart
+        vol[8:10, 9:11, 9:11] = 1  # blob 1
+        vol[12:14, 9:11, 9:11] = 1  # blob 2 — 2 voxels apart
 
         obj, _ = persistent_homology_dilation(
-            vol2, max_steps=10, Lambda=0.5, Connectivity=26
+            vol, max_steps=10, Lambda=0.5, Connectivity=26
         )
         assert obj[-1] == 1  # merged into one
+
+
+# ---------------------------------------------------------------------------
+# step_callback for all three persistent homology functions
+# ---------------------------------------------------------------------------
+
+
+class TestStepCallback:
+    def _make_blob(self):
+        vol = np.zeros((10, 10, 10), dtype=np.uint8)
+        vol[3:7, 3:7, 3:7] = 1
+        return vol
+
+    def test_erosion_callback_called_max_steps_times(self):
+        calls = []
+        persistent_homology_erosion(
+            self._make_blob(),
+            max_steps=5,
+            Lambda=0.5,
+            Connectivity=26,
+            step_callback=lambda s, t: calls.append((s, t)),
+        )
+        assert len(calls) == 5
+        assert calls[0] == (1, 5)
+        assert calls[-1] == (5, 5)
+
+    def test_dilation_callback_called_max_steps_times(self):
+        calls = []
+        persistent_homology_dilation(
+            self._make_blob(),
+            max_steps=5,
+            Lambda=0.5,
+            Connectivity=26,
+            step_callback=lambda s, t: calls.append((s, t)),
+        )
+        assert len(calls) == 5
+        assert calls[-1] == (5, 5)
+
+    def test_dilation_internal_callback_called_max_steps_times(self):
+        blob = self._make_blob()
+        container = np.ones((10, 10, 10), dtype=np.uint8)
+        calls = []
+        persistent_homology_dilation_internal_object(
+            blob,
+            container,
+            max_steps=5,
+            Lambda=0.5,
+            Connectivity=26,
+            step_callback=lambda s, t: calls.append((s, t)),
+        )
+        assert len(calls) == 5
+        assert calls[-1] == (5, 5)
+
+    def test_no_callback_still_works(self):
+        # Verify backward compat: no step_callback arg = no error
+        obj, _ = persistent_homology_erosion(
+            self._make_blob(), max_steps=3, Lambda=0.5, Connectivity=26
+        )
+        assert len(obj) == 4  # step 0 + 3 steps
