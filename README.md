@@ -3,25 +3,59 @@
 [![License BSD-3](https://img.shields.io/pypi/l/napari-persistent-homology.svg?color=green)](https://github.com/mertesdorfj/napari-persistent-homology/raw/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/napari-persistent-homology.svg?color=green)](https://pypi.org/project/napari-persistent-homology)
 [![Python Version](https://img.shields.io/pypi/pyversions/napari-persistent-homology.svg?color=green)](https://python.org)
-[![tests](https://github.com/mertesdorfj/napari-persistent-homology/workflows/tests/badge.svg)](https://github.com/mertesdorfj/napari-persistent-homology/actions)
+[![tests](https://github.com/mertesdorfj/napari-persistent-homology/actions/workflows/test_and_deploy.yml/badge.svg)](https://github.com/mertesdorfj/napari-persistent-homology/actions/workflows/test_and_deploy.yml)
 [![codecov](https://codecov.io/gh/mertesdorfj/napari-persistent-homology/branch/main/graph/badge.svg)](https://codecov.io/gh/mertesdorfj/napari-persistent-homology)
 [![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/napari-persistent-homology)](https://napari-hub.org/plugins/napari-persistent-homology)
 [![npe2](https://img.shields.io/badge/plugin-npe2-blue?link=https://napari.org/stable/plugins/index.html)](https://napari.org/stable/plugins/index.html)
-[![Copier](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/copier-org/copier/master/img/badge/badge-grayscale-inverted-border-purple.json)](https://github.com/copier-org/copier)
 
-3D shape analysis of binary segmentations using persistent homology
+**3D shape analysis of binary segmentations using persistent homology.**
 
 ----------------------------------
 
-This [napari] plugin wraps research code from [Wang et al. 2022](https://doi.org/10.1101/2022.11.08.515664) for 3D shape analysis of binary segmentation volumes using persistent homology.
+## Overview
 
-<!--
-Don't miss the full getting started guide to set up your new package:
-https://github.com/napari/napari-plugin-template#getting-started
+`napari-persistent-homology` is an interactive [napari] dock widget for measuring the **size and spacing of structures in 3D binary segmentations** — directly, reproducibly, and without manual point-picking.
 
-and review the napari docs for plugin developers:
-https://napari.org/stable/plugins/index.html
--->
+Given a segmented 3D volume (a `Labels` mask), the plugin quantifies properties such as the thickness of sheet-like structures, the radius of tubular ones, the distance between separate objects, and the regularity of their spacing inside a parent compartment. Each of these questions is reduced to a single characteristic length. The measurement is based on **persistent homology**: The structure is gradually eroded or dilated and the number of objects / enclosed holes is counted at each step. The shape of the resulting count curve encodes a characteristic length scale (a radius, thickness, or spacing) together with a spread (FWHM) that reflects how uniform or variable that length is. Because morphology grows or shrinks the structure uniformly in every direction, the result is **directionally unbiased** and independent of where measurement endpoints would have been placed by hand, making it well suited to large, automated 3D analyses.
+
+The method is not specific to any particular kind of data: Any 3D binary mask is supported, whether the structures are sheet-like, tubular, or blob-like (e.g. membranes, fibres, vesicles, pores, cells). It was introduced for characterising **mitochondrial cristae** in FIB-SEM electron-microscopy data by [Wang et al., 2024](https://doi.org/10.1038/s42003-024-06045-4) (*Communications Biology* **7**:377); this plugin is based on their work and provides a point-and-click napari interface to their analysis code, removing the need for scripting.
+
+The plugin works on any 3D binary `Labels` layer and supports three analysis modes:
+
+| Mode | What it measures | Example use cases |
+|---|---|---|
+| **Object radius / half-thickness (erosion)** | The typical radius of solid objects, or half-thickness of sheet/slab structures | Cristae half-thickness, fibre radius, membrane half-width. The plugin also reports the full width / diameter. |
+| **Object spacing (dilation)** | The typical distance between separate objects | Inter-mitochondria spacing, fibre-to-fibre distance |
+| **Internal spacing (dilation in container)** | The typical spacing between objects inside a parent compartment | Cristae spacing inside a mitochondrion |
+
+In every mode, the plugin builds a **count curve**: At each erosion or dilation step, it records how many separate objects (or enclosed holes) currently exist. This curve rises to a peak and then falls, and two numbers summarise it:
+
+- **Peak location**: *Where* the curve peaks, which corresponds to the characteristic length that is measured. As shown in the paper, this peak sits at *half* the relevant distance, so the plugin reports both the raw peak (a radius / half-thickness, or a half-spacing) and twice it (the full width / diameter, or the full inter-object distance).
+- **FWHM (full-width at half-maximum)**: *How wide* the peak is, which indicates how much that length varies across the structure: A sharp peak means a uniform size, a broad peak means a mix of sizes.
+
+Results appear in an embedded plot and can be exported to CSV together with all the parameters used. Under the hood, the analysis runs on a background thread, so the napari UI stays responsive even on large volumes.
+
+## How it works
+
+The method combines mathematical morphology with persistent homology, following Wang et al. (2024):
+
+![Persistent homology standardises distance measurements](https://raw.githubusercontent.com/mertesdorfj/napari-persistent-homology/main/docs/images/Wang_et_al_figure3.jpg)
+
+*The idea behind the method, illustrated on mitochondrial cristae (figure from [Wang et al., 2024](https://doi.org/10.1038/s42003-024-06045-4), CC BY 4.0).* **(a–c)** A distance such as a crista width (purple) or the gap between cristae (yellow) can be drawn in many equally plausible ways — the choice of start- and end-point is subjective, so manual measurements are hard to reproduce. **(d–e)** Persistent homology removes that ambiguity. The structure is grown step by step (red arrows); as two opposing surfaces approach, the gap between them closes into an enclosed **hole** (yellow hatching) that later vanishes once the surfaces merge. The step at which the most holes are open (here, dilation round 2) is the moment most surfaces just touch — and since each surface has grown by the same amount, that step equals **half** the gap between them, independent of orientation. **(d vs. e)** A smoother surface (d) opens and closes its holes over a narrow range of steps, whereas a more curved or rough surface (e) keeps them open for longer; this shows up as a **wider count-curve peak (larger FWHM)**, which is why the FWHM acts as a measure of surface curvature / roughness.
+
+The method by Chenhao Wang et al. turns this idea into three steps:
+
+1. **Subpixel morphology**: The binary mask is repeatedly dilated or eroded by a *fraction* of a voxel per step. Rather than the one-voxel-at-a-time classical operators, the volume is evolved under the level-set PDE `dU/dt = ±|∇U|` using a first-order Osher–Sethian upwind scheme (paper eqs. 3–6). With the default step `λ = 0.1`, ten steps equal one full voxel layer added (dilation) or removed (erosion).
+
+2. **Counting**: After each step, the (soft) mask is binarised at 0.5 and passed to a 26-connected 3D connected-components labeller:
+   - **Erosion → object count**: As the object shrinks, thin regions pinch off and the foreground briefly splits into more components before vanishing.
+   - **Dilation → hole count**: As objects grow, the gaps between them close into enclosed holes that later disappear when surfaces merge. (The outer background is always one extra component, so it is subtracted off). In *internal-spacing* mode, holes are counted only inside the container compartment: The dilated mask is restricted to the container first, so gaps outside it are ignored. In Wang et al. (2024), this is used to confine the analysis to the interior of each mitochondrion.
+
+3. **Feature extraction**: The resulting count curve is Gaussian-smoothed and summarised by two numbers (the first few steps are skipped according to a user-defined offset value, since the curve is noisiest there):
+   - **Peak location**: The step at which the count is highest. This is the step where the most surfaces are simultaneously touching, which happens when each surface has moved inward (erosion) or outward (dilation) by half the distance separating it from its neighbour. The peak therefore measures *half* of that distance - a radius / half-thickness (erosion) or a half-gap (dilation) - and the plugin reports both this value and twice it (the full thickness or full spacing).
+   - **FWHM**: The width of the count-curve peak at half its height, a proxy for surface roughness / curvature: Rougher, more curved surfaces keep holes and objects alive over more rounds, widening the peak.
+
+All step-unit results are divided by `ceil(1/λ)` to convert back to voxel units, and then, optionally, to nm / µm using the physical voxel size entered in the widget.
 
 ## Installation
 
@@ -31,47 +65,147 @@ You can install `napari-persistent-homology` via [pip]:
 pip install napari-persistent-homology
 ```
 
-If napari is not already installed, you can install `napari-persistent-homology` with napari and Qt via:
+If napari is not already installed, you can install the plugin together with napari and a Qt backend via:
 
 ```bash
 pip install "napari-persistent-homology[all]"
 ```
 
-
-To install latest development version:
+To install the latest development version straight from GitHub:
 
 ```bash
 pip install git+https://github.com/mertesdorfj/napari-persistent-homology.git
 ```
 
+The plugin requires Python ≥ 3.10.
 
+## Quick start
+
+1. Launch napari (`napari` from your terminal, or from your IDE).
+2. Open the widget from the menu bar under either:
+   - **Plugins → Persistent Homology (Persistent Homology 3D)**, or
+   - **Layers → Measure → Persistent Homology (Persistent Homology 3D)**.
+3. Load a 3D binary segmentation (your own `.tif` / `.npy` file, or the bundled sample under **File → Open Sample → Cristae binary mask 3D (Persistent Homology 3D)**).
+4. Choose an analysis mode and click **Run Analysis**.
+5. Inspect the count curve and the resulting measurements (radius / spacing and the full-width at half-maximum, FWHM) in the **Results** section.
+6. Click **Save Results** to export the summary values to CSV, or **Save Curve & Plot** to export the count-curve data (CSV) plus the embedded plot (PNG).
+
+## How to use the widget
+
+![The widget on startup](https://raw.githubusercontent.com/mertesdorfj/napari-persistent-homology/main/docs/images/plugin_screenshot_start.png)
+
+*The widget docked in napari on startup, before any analysis has been run.*
+
+The widget is laid out top to bottom:
+
+1. **Input** — pick the `Labels` layer that contains your binary segmentation. In *Internal spacing* mode, a second dropdown appears for selecting the container layer.
+2. **Analysis** — pick one of the three modes (see table above).
+3. **Parameters** — basic parameters are always visible; click **▶ Advanced mode** to reveal three more advanced options.
+4. **Physical Scale** — enter your voxel size and physical unit if you want results in nm / µm in addition to voxels.
+5. **Run Analysis** — starts the computation on a background thread.
+6. **Plot** — the raw and smoothed count curve, with the detected peak marked (dashed vertical line) and the FWHM shown as a dashed horizontal bar.
+7. **Results** — the raw peak (radius / half-spacing), twice that (full width / inter-object spacing), and the full-width at half-maximum (FWHM) in voxels (and, if voxel size is set, in physical units too).
+8. **Save Results** and **Save Curve & Plot** — two separate export buttons. The first writes a small CSV with just the summary values from the Results section; the second writes the raw + smoothed count curve to CSV *and* saves the count curve plot as a PNG. See **Outputs** below.
+
+### Input parameters
+
+| Parameter | Where | Default | Description |
+|---|---|---|---|
+| **Segmentation layer** | Input | — | The `Labels` layer containing your binary segmentation (all non-zero voxels are treated as foreground). |
+| **Container layer** | Input (internal-spacing mode only) | — | A second `Labels` layer defining the parent compartment for *Internal spacing* mode. |
+| **Mode** | Analysis | Object radius / half-thickness | One of the three analysis modes described above. |
+| **Lambda** | Parameters | 0.1 | Subpixel step size in voxel-length units. `0.1` means 10 morphology steps per voxel. Smaller values are more accurate but slower. |
+| **Max steps** | Parameters | 100 | Total number of morphology steps. Limits the maximum measurable distance to `max_steps × Lambda` voxels (e.g. 100 × 0.1 = 10 voxels). |
+| **Connectivity** | Advanced | 26 | 3D connected-component neighbourhood used by the counters (options: `6`, `18`, `26`). `26` is the full 3D neighbourhood (face + edge + corner) and is recommended for most datasets. |
+| **Sigma** | Advanced | 5.0 | Standard deviation of the Gaussian smoothing applied to the count curve before peak-finding. Larger values give smoother curves and alleviate more noise, but can also blur close peaks and lead to more inaccurate / shifted peak results. |
+| **Offset** | Advanced | 5 | Number of initial steps to skip when searching for the peak. The very first steps are dominated by noise and small irregularities in the surface rather than real structure, which can create a misleading spike near step 0; ignoring them keeps the search on the true peak. Recommended upper bound: `int(1 / Lambda)` (one full voxel layer), so that a genuine peak is never skipped. |
+| **Voxel size X / Y / Z** | Physical Scale | `—` in `vox` mode, `1.0` in `nm` / `µm` mode | The physical voxel size along each axis, used to convert results from voxels to nm / µm. Defaults to `1.0` the first time you switch the unit to `nm` or `µm` - adjust to your actual voxel size. Stays at `—` and is skipped while the selected unit is `vox`. All three values must be greater than 0 when the unit is `nm` or `µm`; clicking 'Run Analysis' with a 0 in any axis raises an error and blocks the run. |
+| **Unit** | Physical Scale | vox | The physical unit in which results are reported (available options: `vox`, `nm`, `µm`). |
+
+> **Anisotropic voxels.** The analysis pipeline operates on the binary volume isotropically - it has no internal knowledge of physical voxel anisotropy. When you provide the voxel size, the plugin converts the voxel-unit results to physical units using the **arithmetic mean** of the X / Y / Z voxel sizes. For datasets with strong anisotropy, the physical-unit result is therefore an approximation and should be treated with caution; consider resampling to an isotropic grid first if exact physical sizes matter (might be added in a future version of this plugin).
+
+### Outputs
+
+![The widget displaying analysis results](https://raw.githubusercontent.com/mertesdorfj/napari-persistent-homology/main/docs/images/plugin_screenshot_result.png)
+
+*The widget following a completed run in **Object radius / half-thickness (erosion)** mode, showing the count curve with the detected peak and FWHM bar, and the corresponding measurements in the Results section below.*
+
+After a successful run, the widget displays:
+
+- **Plot** — the raw count curve (light blue), the Gaussian-smoothed curve (darker blue), a dashed vertical line marking the detected peak, and a dashed orange horizontal bar at half-peak height spanning the FWHM. A legend reports the peak and FWHM values in voxels. The x-axis is the morphology-step index (not voxels).
+- **Radius / half-thickness (erosion)** — *shown only in erosion mode.* The peak location of the object-count curve: The typical radius of solid objects, or the half-thickness of sheet-like structures.
+- **Width / thickness (erosion)** — *shown only in erosion mode.* Exactly twice the radius / half-thickness. For solid objects this is the full diameter; for sheet/slab structures it is the full thickness.
+- **Half-spacing (dilation)** — *shown only in dilation modes.* The peak location of the hole-count curve. Per the paper this peak is *half* the average gap between objects, so it is reported as a half-spacing.
+- **Inter-object spacing (dilation)** — *shown only in dilation modes.* Exactly twice the half-spacing result: The full typical distance between separate objects.
+- **Full-width at half-maximum (FWHM)** — *shown in every mode.* The spread of the count curve around its peak, measured at half of the peak height. Larger values indicate more variability in the size distribution of the analysed structures (a proxy for surface roughness / curvature).
+
+In every mode, values are shown in the chosen physical unit first with the voxel value in brackets (e.g. `25.00 nm  (5.00 vox)`) when a physical unit is selected and the voxel sizes are set. With unit `vox`, only the voxel value is shown.
+
+> **Note on switching modes.** The Results section is "frozen" - it always shows the labels and values from the *last* run. The labels only update when you click 'Run Analysis' again.
+
+There are **two export buttons** below the Results section:
+
+**Save Results**: Prompts for a CSV path and writes only the summary values shown in the Results compartment:
+
+- A title line — `# napari-persistent-homology — Summary Results`.
+- A comment header — `# Mode: …`, `# Parameters: …`, and `# Voxel size: …` (or a note that it was not set).
+- A `Metric` / `Value_vox` (and `Value_<unit>` when a physical voxel size is set, e.g. `Value_nm` or `Value_um`) table whose row labels match the results in the widget:
+  - In erosion mode: `Radius / half-thickness`, `Width / thickness`, `Full-width at half-maximum`
+  - In dilation modes: `Half-spacing`, `Inter-object spacing`, `Full-width at half-maximum`
+
+**Save Curve & Plot**: Prompts for a single path and writes two siblings derived from it:
+
+- `<base>.csv` — title line `# napari-persistent-homology — Object Count Curve` (erosion mode) or `# napari-persistent-homology — Hole Count Curve` (dilation modes), the same metadata header as the summary file, plus the full per-round count curve. Columns are `Erosion_round` or `Dilation_round`, followed by `Count_raw` and `Count_smoothed`.
+- `<base>.png` — the count curve plot generated with matplotlib as it appears in the widget, rendered at 150 DPI with a tight bounding box.
+
+If you pick e.g. the name `result.csv`, the PNG is saved alongside as `result.png`. Any `.csv` or `.png` extension you type is stripped first so the two files always share a base name.
+
+
+### Sample data
+
+A small 3D cristae binary mask is bundled with the plugin and is available via **File → Open Sample → Cristae binary mask 3D (Persistent Homology 3D)**. It is a 114 × 163 × 234 `uint8` volume from a FIB-SEM acquisition and is a quick way to confirm that the plugin is working and to explore the '*Object radius / half-thickness (erosion)*' and '*Object spacing (dilation)*' modes.
+
+## Citation
+
+If you use this plugin in your research, please cite the original paper that the analysis pipeline is based on:
+
+> Wang, C., Østergaard, L., Hasselholt, S., & Sporring, J. (2024). *A semi-automatic method for extracting mitochondrial cristae characteristics from 3D focused ion beam scanning electron microscopy data*. Communications Biology, 7, 377. https://doi.org/10.1038/s42003-024-06045-4
 
 ## Contributing
 
-Contributions are very welcome. Tests can be run with [tox], please ensure
-the coverage at least stays the same before you submit a pull request.
+Contributions are very welcome. Please:
+
+1. Fork the repository and create a feature branch.
+2. Install the development environment (the `--group` flag needs pip ≥ 25.1, which is the first version to support PEP 735 dependency groups):
+   ```bash
+   pip install -e . --group dev
+   ```
+   On older pip, install the dev tools by hand instead:
+   ```bash
+   pip install -e .
+   pip install "napari[qt]" pytest pytest-cov pytest-qt
+   ```
+3. Make sure the test suite still passes and add tests for any new behaviour:
+   ```bash
+   python -m pytest tests/ -v
+   ```
+4. Open a pull request describing your change.
+
+Please ensure the coverage at least stays the same before you submit a pull request.
 
 ## License
 
-Distributed under the terms of the [BSD-3] license,
-"napari-persistent-homology" is free and open source software
+Distributed under the terms of the [BSD-3] license, `napari-persistent-homology` is free and open source software.
 
 ## Issues
 
-If you encounter any problems, please [file an issue] along with a detailed description.
+If you encounter any problems, please [file an issue] along with a detailed description (napari version, plugin version, OS, and the smallest input that reproduces the problem if possible).
+
+## Acknowledgements
+
+This plugin wraps the research code originally written by **Chenhao Wang** and colleagues. The napari plugin scaffolding was generated from the official [napari plugin template](https://github.com/napari/napari-plugin-template).
 
 [napari]: https://github.com/napari/napari
-[copier]: https://copier.readthedocs.io/en/stable/
-[MIT]: http://opensource.org/licenses/MIT
 [BSD-3]: http://opensource.org/licenses/BSD-3-Clause
-[GNU GPL v3.0]: http://www.gnu.org/licenses/gpl-3.0.txt
-[GNU LGPL v3.0]: http://www.gnu.org/licenses/lgpl-3.0.txt
-[Apache Software License 2.0]: http://www.apache.org/licenses/LICENSE-2.0
-[Mozilla Public License 2.0]: https://www.mozilla.org/media/MPL/2.0/index.txt
-[napari-plugin-template]: https://github.com/napari/napari-plugin-template
-
 [file an issue]: https://github.com/mertesdorfj/napari-persistent-homology/issues
-
-[tox]: https://tox.readthedocs.io/en/latest/
 [pip]: https://pypi.org/project/pip/
-[PyPI]: https://pypi.org/
