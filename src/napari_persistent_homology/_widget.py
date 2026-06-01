@@ -35,17 +35,20 @@ import napari.layers
 import numpy as np
 from napari.qt.threading import thread_worker
 from napari.viewer import Viewer
-from qtpy.QtCore import QObject, Signal
+from qtpy.QtCore import QObject, Qt, Signal
 from qtpy.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -284,6 +287,13 @@ class PersistentHomologyWidget(QWidget):
         self._last_result = None  # set after a successful run, enables Save
         self._run_params: dict = {}
 
+        # Floor the dock at the natural width of the longest row — the
+        # Physical Scale line with X / Y / Z voxel-size spinboxes plus
+        # the unit dropdown. Below this width the row clips and the
+        # napari dark-theme transient scrollbar starts overlaying the
+        # right-edge controls.
+        self.setMinimumWidth(520)
+
         self._build_ui()
         self._refresh_layer_combos()
 
@@ -299,9 +309,35 @@ class PersistentHomologyWidget(QWidget):
         Each numbered section in the body corresponds to one row in the
         widget layout described in the class docstring above.
         """
-        main_layout = QVBoxLayout()
+        # Wrap all content in a QScrollArea so the dock gracefully
+        # acquires a vertical scrollbar when napari is shrunk below the
+        # plugin's natural height. 'setWidgetResizable(True)' makes the
+        # inner widget resize to match the scroll area's width (so
+        # descriptions still wrap horizontally instead of triggering a
+        # horizontal scrollbar). 'main_layout' from here on is the
+        # layout of the inner widget — the rest of the build code is
+        # unchanged.
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer_layout.addWidget(scroll)
+
+        inner = QWidget()
+        scroll.setWidget(inner)
+        main_layout = QVBoxLayout(inner)
         main_layout.setSpacing(6)
-        self.setLayout(main_layout)
+        # napari's dark theme uses a 'transient' scrollbar style that
+        # overlays the viewport instead of reserving dedicated
+        # horizontal space, so without an extra right margin the
+        # scrollbar paints on top of the controls and descriptions on
+        # the right edge. Default Qt margins are (13, 13, 13, 13); the
+        # right margin is bumped to 24 px to clear napari's scrollbar
+        # (~15 px wide) with a small visual buffer.
+        main_layout.setContentsMargins(13, 13, 24, 13)
 
         # 1 ── Input layers ─────────────────────────────────────────────────
         input_group = QGroupBox('Input')
@@ -338,37 +374,81 @@ class PersistentHomologyWidget(QWidget):
         params_layout = QVBoxLayout()
         params_group.setLayout(params_layout)
 
-        params_form = QFormLayout()
+        # Description-label helper: small gray italic explanation shown
+        # on its own row directly below each parameter control.
+        # 'heightForWidth' on the size policy tells the grid layout to
+        # ask the wrapped label how tall it actually needs to be at the
+        # column's current width, instead of falling back on the
+        # single-line 'sizeHint().height()' (which would clip the
+        # wrapped text). Spanning the full row width keeps the
+        # resulting height small (1–2 lines) and avoids the dock-
+        # inflation feedback loop that an in-row narrow column would
+        # otherwise cause.
+        def _desc(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(
+                'color: gray; font-style: italic; padding-left: 12px;'
+            )
+            lbl.setMinimumWidth(50)
+            sp = lbl.sizePolicy()
+            sp.setHeightForWidth(True)
+            lbl.setSizePolicy(sp)
+            return lbl
 
-        _lambda_tip = (
-            'Subpixel step size. Smaller = more accurate but slower.\n'
-            '(0.1 = 10 steps per voxel)'
-        )
+        # Compact width for spinboxes / combos so the description column
+        # to their right gets the rest of the row.
+        _SPIN_WIDTH = 80
+
+        # ── Basic parameter grid ─────────────────────────────────────────
+        # Each parameter occupies two rows: a control row (label + spin)
+        # then a description row spanning the full layout width.
+        basic_grid = QGridLayout()
+        basic_grid.setColumnStretch(2, 1)
+        basic_grid.setHorizontalSpacing(8)
+        basic_grid.setVerticalSpacing(4)
+
+        # Lambda
         self._lambda_spin = QDoubleSpinBox()
         self._lambda_spin.setRange(0.1, 1.0)
         self._lambda_spin.setSingleStep(0.05)
         self._lambda_spin.setValue(0.1)
         self._lambda_spin.setDecimals(2)
-        self._lambda_spin.setToolTip(_lambda_tip)
-        _lambda_lbl = QLabel('Lambda:')
-        _lambda_lbl.setToolTip(_lambda_tip)
-        params_form.addRow(_lambda_lbl, self._lambda_spin)
-
-        _max_steps_tip = (
-            'Maximum erosion/dilation steps.\n'
-            'Limits the maximum measurable distance to max_steps × Lambda voxels.'
+        self._lambda_spin.setMaximumWidth(_SPIN_WIDTH)
+        basic_grid.addWidget(QLabel('Lambda:'), 0, 0)
+        basic_grid.addWidget(self._lambda_spin, 0, 1)
+        basic_grid.addWidget(
+            _desc(
+                'Subpixel step size. 0.1 = 10 steps/voxel; '
+                'smaller is more accurate but slower.'
+            ),
+            1,
+            0,
+            1,
+            3,
         )
+
+        # Max steps
         self._max_steps_spin = QSpinBox()
         self._max_steps_spin.setRange(1, 10000)
         self._max_steps_spin.setValue(100)
-        self._max_steps_spin.setToolTip(_max_steps_tip)
-        _max_steps_lbl = QLabel('Max steps:')
-        _max_steps_lbl.setToolTip(_max_steps_tip)
-        params_form.addRow(_max_steps_lbl, self._max_steps_spin)
+        self._max_steps_spin.setMaximumWidth(_SPIN_WIDTH)
+        basic_grid.addWidget(QLabel('Max steps:'), 2, 0)
+        basic_grid.addWidget(self._max_steps_spin, 2, 1)
+        basic_grid.addWidget(
+            _desc(
+                'Total morphology steps. 100 is a good starting '
+                'point; larger values mean longer runtimes.'
+            ),
+            3,
+            0,
+            1,
+            3,
+        )
 
-        params_layout.addLayout(params_form)
+        params_layout.addLayout(basic_grid)
 
-        # Collapsible Advanced mode section
+        # Collapsible Advanced-mode section toggle
         self._advanced_toggle = QToolButton()
         self._advanced_toggle.setText('▶  Advanced mode')
         self._advanced_toggle.setCheckable(True)
@@ -380,54 +460,79 @@ class PersistentHomologyWidget(QWidget):
         params_layout.addWidget(self._advanced_toggle)
 
         self._advanced_widget = QWidget()
-        advanced_form = QFormLayout()
-        advanced_form.setContentsMargins(12, 0, 0, 0)
-        self._advanced_widget.setLayout(advanced_form)
+        adv_grid = QGridLayout()
+        adv_grid.setContentsMargins(12, 0, 0, 0)
+        adv_grid.setColumnStretch(2, 1)
+        adv_grid.setHorizontalSpacing(8)
+        adv_grid.setVerticalSpacing(4)
+        self._advanced_widget.setLayout(adv_grid)
+        # Forward heightForWidth from 'adv_grid' (whose description labels
+        # have heightForWidth=True) up to the surrounding 'params_layout'.
+        # Without this, the intermediate QWidget reports a single-line
+        # sizeHint and the wrapped descriptions get clipped.
+        sp = self._advanced_widget.sizePolicy()
+        sp.setHeightForWidth(True)
+        self._advanced_widget.setSizePolicy(sp)
         self._advanced_widget.hide()
 
-        _conn_tip = (
-            '3D neighbourhood connectivity.\n'
-            '26 = full 3D neighbourhood. Recommended for most datasets.'
-        )
+        # Connectivity
         self._connectivity_combo = QComboBox()
         self._connectivity_combo.addItems(['6', '18', '26'])
         self._connectivity_combo.setCurrentIndex(2)
-        self._connectivity_combo.setToolTip(_conn_tip)
-        _conn_lbl = QLabel('Connectivity:')
-        _conn_lbl.setToolTip(_conn_tip)
-        advanced_form.addRow(_conn_lbl, self._connectivity_combo)
-
-        _sigma_tip = (
-            'Gaussian smoothing sigma applied to the count curve\n'
-            'before feature extraction.'
+        self._connectivity_combo.setMaximumWidth(_SPIN_WIDTH)
+        adv_grid.addWidget(QLabel('Connectivity:'), 0, 0)
+        adv_grid.addWidget(self._connectivity_combo, 0, 1)
+        adv_grid.addWidget(
+            _desc(
+                '3D neighbour connectivity. 26 (full neighbourhood) '
+                'is recommended.'
+            ),
+            1,
+            0,
+            1,
+            3,
         )
+
+        # Sigma
         self._sigma_spin = QDoubleSpinBox()
         self._sigma_spin.setRange(0.1, 20.0)
         self._sigma_spin.setSingleStep(0.1)
         self._sigma_spin.setValue(3.0)
         self._sigma_spin.setDecimals(1)
-        self._sigma_spin.setToolTip(_sigma_tip)
-        _sigma_lbl = QLabel('Sigma:')
-        _sigma_lbl.setToolTip(_sigma_tip)
-        advanced_form.addRow(_sigma_lbl, self._sigma_spin)
-
-        _offset_tip = (
-            'Steps to skip at the start of the count curve\n'
-            '(ignores initial artifact).\n'
-            'Default: int(1 / Lambda) — one full voxel layer.\n'
-            'Auto-updates when Lambda is changed.'
+        self._sigma_spin.setMaximumWidth(_SPIN_WIDTH)
+        adv_grid.addWidget(QLabel('Sigma:'), 2, 0)
+        adv_grid.addWidget(self._sigma_spin, 2, 1)
+        adv_grid.addWidget(
+            _desc(
+                'Gaussian smoothing of the count curve before peak detection.'
+            ),
+            3,
+            0,
+            1,
+            3,
         )
+
+        # Offset
         self._offset_spin = QSpinBox()
         self._offset_spin.setRange(0, 20)
         self._offset_spin.setValue(int(ceil(1.0 / self._lambda_spin.value())))
-        self._offset_spin.setToolTip(_offset_tip)
-        _offset_lbl = QLabel('Offset:')
-        _offset_lbl.setToolTip(_offset_tip)
-        advanced_form.addRow(_offset_lbl, self._offset_spin)
+        self._offset_spin.setMaximumWidth(_SPIN_WIDTH)
+        adv_grid.addWidget(QLabel('Offset:'), 4, 0)
+        adv_grid.addWidget(self._offset_spin, 4, 1)
+        adv_grid.addWidget(
+            _desc(
+                'Auto-set to int(1 / Lambda) (one full voxel layer); '
+                'recommended to leave unchanged.'
+            ),
+            5,
+            0,
+            1,
+            3,
+        )
 
         # Keep the offset tied to '1 / Lambda' whenever Lambda is changed.
-        # Connecting only now (after the offset spinbox exists) avoids firing
-        # the slot during the initial 'setValue(0.1)' above.
+        # Connecting only now (after the offset spinbox exists) avoids
+        # firing the slot during the initial 'setValue(0.1)' above.
         self._lambda_spin.valueChanged.connect(self._on_lambda_changed)
 
         params_layout.addWidget(self._advanced_widget)
