@@ -328,16 +328,17 @@ class PersistentHomologyWidget(QWidget):
 
         inner = QWidget()
         scroll.setWidget(inner)
+        # Add a little vertical breathing room inside every section box so
+        # the first content row doesn't sit flush against the QGroupBox
+        # title. Applied once here so all sections look consistent.
+        inner.setStyleSheet('QGroupBox { padding-top: 10px; }')
         main_layout = QVBoxLayout(inner)
         main_layout.setSpacing(6)
-        # napari's dark theme uses a 'transient' scrollbar style that
-        # overlays the viewport instead of reserving dedicated
-        # horizontal space, so without an extra right margin the
-        # scrollbar paints on top of the controls and descriptions on
-        # the right edge. Default Qt margins are (13, 13, 13, 13); the
-        # right margin is bumped to 24 px to clear napari's scrollbar
-        # (~15 px wide) with a small visual buffer.
-        main_layout.setContentsMargins(13, 13, 24, 13)
+        # Tight margins on the left / top / bottom; the right margin is
+        # kept generous so napari's dark-theme transient scrollbar
+        # (~15 px wide) lands in clear space instead of overlapping
+        # controls and descriptions on the right edge.
+        main_layout.setContentsMargins(6, 6, 18, 6)
 
         # 1 ── Input layers ─────────────────────────────────────────────────
         input_group = QGroupBox('Input')
@@ -398,7 +399,7 @@ class PersistentHomologyWidget(QWidget):
 
         # Compact width for spinboxes / combos so the description column
         # to their right gets the rest of the row.
-        _SPIN_WIDTH = 80
+        _SPIN_WIDTH = 95
 
         # ── Basic parameter grid ─────────────────────────────────────────
         # Each parameter occupies two rows: a control row (label + spin)
@@ -547,7 +548,9 @@ class PersistentHomologyWidget(QWidget):
             "Set before running. Leave on 'vox' to show results in voxels only."
         )
         scale_hint.setWordWrap(True)
-        scale_hint.setStyleSheet('color: gray; font-style: italic;')
+        scale_hint.setStyleSheet(
+            'color: gray; font-style: italic; padding-left: 12px;'
+        )
         scale_vbox.addWidget(scale_hint)
 
         xyz_row = QHBoxLayout()
@@ -563,7 +566,7 @@ class PersistentHomologyWidget(QWidget):
             spin.setRange(0.0, 100000.0)
             spin.setSingleStep(0.1)
             spin.setValue(0.0)
-            spin.setDecimals(3)
+            spin.setDecimals(2)
             spin.setSpecialValueText(
                 '—'
             )  # shows "—" when value == minimum (0.0)
