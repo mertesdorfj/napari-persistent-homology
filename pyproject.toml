@@ -6,8 +6,8 @@ readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 authors = [
-  {name = "Chenhao Wang, Julia Mertesdorf"},
-  {email = "jume@di.ku.dk"},
+  {name = "Chenhao Wang"},
+  {name = "Julia Mertesdorf", email = "jume@di.ku.dk"},
 ]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
