@@ -1,10 +1,10 @@
 # napari-persistent-homology
 
-[![License BSD-3](https://img.shields.io/pypi/l/napari-persistent-homology.svg?color=green)](https://github.com/mertesdorfj/napari-persistent-homology/raw/main/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/napari-persistent-homology.svg?color=green)](https://pypi.org/project/napari-persistent-homology)
-[![Python Version](https://img.shields.io/pypi/pyversions/napari-persistent-homology.svg?color=green)](https://python.org)
+[![License BSD-3](https://img.shields.io/pypi/l/napari-persistent-homology.svg?color=green&v=2)](https://github.com/mertesdorfj/napari-persistent-homology/raw/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/napari-persistent-homology.svg?color=green&v=2)](https://pypi.org/project/napari-persistent-homology)
+[![Python Version](https://img.shields.io/pypi/pyversions/napari-persistent-homology.svg?color=green&v=2)](https://python.org)
 [![tests](https://github.com/mertesdorfj/napari-persistent-homology/actions/workflows/test_and_deploy.yml/badge.svg)](https://github.com/mertesdorfj/napari-persistent-homology/actions/workflows/test_and_deploy.yml)
-[![codecov](https://codecov.io/gh/mertesdorfj/napari-persistent-homology/branch/main/graph/badge.svg)](https://codecov.io/gh/mertesdorfj/napari-persistent-homology)
+[![codecov](https://codecov.io/gh/mertesdorfj/napari-persistent-homology/branch/main/graph/badge.svg?v=2)](https://codecov.io/gh/mertesdorfj/napari-persistent-homology)
 [![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/napari-persistent-homology)](https://napari-hub.org/plugins/napari-persistent-homology)
 [![npe2](https://img.shields.io/badge/plugin-npe2-blue?link=https://napari.org/stable/plugins/index.html)](https://napari.org/stable/plugins/index.html)
 
