@@ -223,6 +223,31 @@ def test_advanced_section_collapsed_initially(make_napari_viewer):
     assert not widget._advanced_toggle.isChecked()
 
 
+def test_parameter_defaults_and_lambda_offset_linkage(make_napari_viewer):
+    """Default Lambda is 0.1 with a hard minimum of 0.1, Sigma defaults to
+    3.0, and the offset tracks 'ceil(1 / Lambda)' — including after
+    changing Lambda in the widget."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+
+    # Lambda: default 0.1 and the spinbox refuses values < 0.1.
+    assert widget._lambda_spin.value() == 0.1
+    assert widget._lambda_spin.minimum() == 0.1
+
+    # Sigma: default 3.0 (was 5.0 in earlier releases).
+    assert widget._sigma_spin.value() == 3.0
+
+    # Offset: default = ceil(1 / Lambda) = 10 at the default Lambda.
+    assert widget._offset_spin.value() == 10
+
+    # Changing Lambda must auto-update offset to ceil(1 / new_lambda).
+    widget._lambda_spin.setValue(0.5)
+    assert widget._offset_spin.value() == 2
+
+    widget._lambda_spin.setValue(0.2)
+    assert widget._offset_spin.value() == 5
+
+
 def test_advanced_section_expands_on_toggle(make_napari_viewer):
     viewer = make_napari_viewer()
     widget = PersistentHomologyWidget(viewer)

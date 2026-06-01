@@ -590,7 +590,7 @@ def compute_FWHM(series, offset=5):
     return full_width_half_maximum
 
 
-def compute_homology_stats(series_of_series, offset=5, SIGMA=5):
+def compute_homology_stats(series_of_series, offset=5, SIGMA=3):
     """
     Smooth one or more count curves and extract peak + FWHM statistics.
 
@@ -603,7 +603,7 @@ def compute_homology_stats(series_of_series, offset=5, SIGMA=5):
         functions 'find_max_location' / 'compute_FWHM'). Default = 5.
     SIGMA: float, optional
         Gaussian smoothing sigma applied to each curve before feature
-        extraction. Default = 5.
+        extraction. Default = 3.
 
     Returns
     -------

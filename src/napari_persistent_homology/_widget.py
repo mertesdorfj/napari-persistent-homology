@@ -345,8 +345,8 @@ class PersistentHomologyWidget(QWidget):
             '(0.1 = 10 steps per voxel)'
         )
         self._lambda_spin = QDoubleSpinBox()
-        self._lambda_spin.setRange(0.01, 1.0)
-        self._lambda_spin.setSingleStep(0.01)
+        self._lambda_spin.setRange(0.1, 1.0)
+        self._lambda_spin.setSingleStep(0.05)
         self._lambda_spin.setValue(0.1)
         self._lambda_spin.setDecimals(2)
         self._lambda_spin.setToolTip(_lambda_tip)
@@ -404,7 +404,7 @@ class PersistentHomologyWidget(QWidget):
         self._sigma_spin = QDoubleSpinBox()
         self._sigma_spin.setRange(0.1, 20.0)
         self._sigma_spin.setSingleStep(0.1)
-        self._sigma_spin.setValue(5.0)
+        self._sigma_spin.setValue(3.0)
         self._sigma_spin.setDecimals(1)
         self._sigma_spin.setToolTip(_sigma_tip)
         _sigma_lbl = QLabel('Sigma:')
@@ -414,15 +414,21 @@ class PersistentHomologyWidget(QWidget):
         _offset_tip = (
             'Steps to skip at the start of the count curve\n'
             '(ignores initial artifact).\n'
-            'Recommended max: int(1 / Lambda).'
+            'Default: int(1 / Lambda) — one full voxel layer.\n'
+            'Auto-updates when Lambda is changed.'
         )
         self._offset_spin = QSpinBox()
-        self._offset_spin.setRange(0, 50)
-        self._offset_spin.setValue(5)
+        self._offset_spin.setRange(0, 20)
+        self._offset_spin.setValue(int(ceil(1.0 / self._lambda_spin.value())))
         self._offset_spin.setToolTip(_offset_tip)
         _offset_lbl = QLabel('Offset:')
         _offset_lbl.setToolTip(_offset_tip)
         advanced_form.addRow(_offset_lbl, self._offset_spin)
+
+        # Keep the offset tied to '1 / Lambda' whenever Lambda is changed.
+        # Connecting only now (after the offset spinbox exists) avoids firing
+        # the slot during the initial 'setValue(0.1)' above.
+        self._lambda_spin.valueChanged.connect(self._on_lambda_changed)
 
         params_layout.addWidget(self._advanced_widget)
         main_layout.addWidget(params_group)
@@ -575,6 +581,21 @@ class PersistentHomologyWidget(QWidget):
         self._advanced_toggle.setText(
             '▼  Advanced mode' if checked else '▶  Advanced mode'
         )
+
+    def _on_lambda_changed(self, new_lambda: float) -> None:
+        """
+        Keep the offset value in sync with '1 / Lambda'.
+
+        The offset masks the noisy initial segment of the count curve;
+        the recommended value scales with 'Lambda' (= one full voxel
+        layer). Whenever the user changes 'Lambda', the offset is reset
+        to 'int(ceil(1 / Lambda))' so it stays consistent without
+        requiring a manual adjustment. The user is free to override the
+        offset afterwards — the next 'Lambda' change will reset it
+        again.
+        """
+        if new_lambda > 0:
+            self._offset_spin.setValue(int(ceil(1.0 / new_lambda)))
 
     def _on_unit_changed(self, unit: str) -> None:
         """
