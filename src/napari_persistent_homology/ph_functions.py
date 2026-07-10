@@ -26,10 +26,17 @@ that). The FWHM measures surface roughness / curvature of the same region —
 rougher, more curved surfaces keep holes/objects alive over more rounds.
 
 Each routine returns '(object_count_curve, hole_count_curve)'. The relevant
-curve is then passed through function 'compute_homology_stats', which Gaussian-
-smooths it and reports the peak location and full-width-at-half-maximum. Raw
-peak/FWHM values are in subpixel-step units — divide by 'ceil(1 / Lambda)'
-to convert to voxel units.
+curve is then passed through function 'compute_homology_stats_v2', which
+smooths it with a Lambda-sized moving average and reports the peak
+location and full-width-at-half-maximum ALREADY converted to voxel units.
+The napari widget uses this v2 pipeline.
+
+Legacy v1 helpers ('find_max_location', 'compute_FWHM',
+'compute_homology_stats') remain in this module for backwards
+compatibility and regression coverage — they Gaussian-smooth the curve
+externally, return step-unit results, and are noise-sensitive on real
+segmentation data. See the docstring of each v2 function for a
+side-by-side comparison with its v1 predecessor.
 
 Source: Wang, Østergaard, Hasselholt, Sporring,
 "A semi-automatic method for extracting mitochondrial cristae characteristics
@@ -527,6 +534,12 @@ def find_max_location(series, offset=5):
     """
     Index of the last occurrence of the maximum of 'series[offset:]'.
 
+    .. deprecated::
+        Legacy v1 function — no longer used by the napari widget.
+        Kept for backwards compatibility with external callers and as
+        regression coverage for the noise-tolerant replacement,
+        'find_max_location_v2'. Prefer v2 for new code.
+
     The initial 'offset' samples are skipped because the count curve is most
     susceptible to noise there. The paper excludes the first five subpixel
     rounds — half of a full morphology round at 'Lambda = 0.1' — for this
@@ -548,9 +561,245 @@ def find_max_location(series, offset=5):
     return max_loc
 
 
+def find_max_location_v2(
+    series, offset=5, Lambda=0.1, rank_peaks_by_smoothed=False
+):
+    """
+    Locate the peak of a count curve — robust, noise-tolerant version.
+
+    Runs the structural analysis (local-maximum detection from the
+    discrete first difference + the first-peak noise filter) entirely
+    on the RAW input curve — a pre-smoothing pass would blur the very
+    count-drop-to-1 pattern the noise filter looks for.
+
+    When several local maxima survive the noise filter, the "tallest"
+    one is selected by weighting each candidate by its count value.
+    The parameter 'rank_peaks_by_smoothed' controls which count curve is
+    used for THAT weighting step (structure detection is always on
+    the raw curve):
+
+    * 'rank_peaks_by_smoothed = False' (default, original Chenhao v2
+      behaviour) — weight by the raw counts. Fastest and cleanest on
+      well-behaved segmentation data.
+    * 'rank_peaks_by_smoothed = True' — weight by a moving-average
+      smoothed version of the curve (window 'round(1 / Lambda)').
+      Useful when the raw curve carries individual noise samples
+      that spike above the true peak — with raw weighting, argmax
+      would pick that spike; with smoothed weighting, the tall but
+      wide real peak wins instead.
+
+    Parameters
+    ----------
+    series: ndarray
+        1D count curve — object or hole counts as a function of
+        subpixel-step. Cast to 'float' internally.
+    offset: int, optional
+        Number of initial samples to skip when locating the peak,
+        matching the paper's convention of excluding the first noisy
+        sub-round of morphology. Default = 5.
+    Lambda: float, optional
+        Subpixel step size in voxel-length units. Used by the noise-
+        filter heuristic to translate voxel-scale thresholds (2 voxel
+        rounds for the 'risky' region, 1 voxel round for the 'stable
+        count = 1' segment) into step counts, and — when
+        'rank_peaks_by_smoothed' is True — to size the moving-average
+        window. Default = 0.1.
+    rank_peaks_by_smoothed: bool, optional
+        See the algorithm description above. Default = False.
+
+    Returns
+    -------
+    int
+        Step index of the selected peak (right-most local maximum
+        after noise filtering). On any internal error the function
+        returns 0.
+
+    Differences vs. 'find_max_location' (v1)
+    ---------------------------------------
+    * v1 returns the right-most position of the GLOBAL maximum of
+      'series[offset:]'. It cannot distinguish a real peak from a
+      spurious early peak that happens to be higher; if a small
+      segmentation-noise blob briefly creates a component, v1 will
+      report the position of that first bump.
+    * v2 identifies every LOCAL maximum from the sign of the first
+      difference, then runs a first-peak noise filter: if the first
+      peak sits within '~ 2 / Lambda' steps (i.e. two full voxel
+      layers) AND the count drops back to 1 for at least '~ 1 /
+      Lambda' consecutive samples AND another peak still exists
+      later in the curve, the first peak is treated as noise and
+      excluded. v2 then returns the right-most surviving peak,
+      weighted by its count value.
+    * v2 handles the degenerate case where the count curve never
+      increases (a 'perfect' shape with no noise that collapses
+      immediately) as a separate branch.
+    """
+    try:
+        series = series.astype(float)
+
+        # Curve used ONLY for weighting the surviving local maxima
+        # when picking the "tallest" peak — the raw series unless
+        # the caller asked us to weight by a smoothed version.
+        if rank_peaks_by_smoothed:
+            weighting_window = max(1, int(np.round(1 / Lambda)))
+            weighting_series = moving_average(series, w=weighting_window)
+        else:
+            weighting_series = series
+
+        # Discrete first difference of the RAW series. Padding with
+        # the boundary values keeps the diff array the same length as
+        # 'series', so index arithmetic below stays aligned.
+        diff_along_series = np.diff(
+            series, prepend=series[0], append=series[-1]
+        )
+
+        if np.max(diff_along_series) == 0:
+            # ── Degenerate branch ────────────────────────────────────
+            # The count never rises — most likely a perfect shape
+            # without noise that collapses in a single round. In this
+            # case treat every position where the diff turns negative
+            # (i.e. the collapse points) as a candidate peak. The '[1:]'
+            # shifts the index by one to compensate for the padding.
+            all_local_maximum = np.signbit(diff_along_series[1:]).astype(int)
+            peaks_only_curve_right = all_local_maximum * weighting_series
+
+        else:
+            # ── Normal branch ────────────────────────────────────────
+            # Reduce the diff to its sign: +1 (rising), -1 (falling),
+            # 0 (plateau). '[:-1]' drops the tail padding we no longer
+            # need now that a real max exists.
+            signed = np.sign(diff_along_series[:-1]).astype(int)
+
+            # Working only with non-zero samples lets us treat brief
+            # flat plateaus as if they were a single point when looking
+            # for sign changes.
+            non_zero_indices = np.where(signed != 0)[0]
+            signed_no_zeros = signed[non_zero_indices]
+
+            # A local maximum is a +1 → -1 transition; the diff of
+            # signs equals -2 at those crossings. This gives the
+            # LEFT-most index of each plateau maximum.
+            strict_zeroless_maximum_left = (
+                np.diff(np.sign(signed_no_zeros)) == -2
+            ).astype(int)
+            strict_zeroless_maximum_left_indices = np.where(
+                strict_zeroless_maximum_left
+            )[0]
+
+            # Mark the left-most maxima back in the original coordinate
+            # frame of 'series'.
+            all_local_maximums_left = np.zeros(signed.shape, dtype=int)
+            all_local_maximums_left[non_zero_indices[:-1]] = (
+                strict_zeroless_maximum_left
+            )
+
+            # For each left-most maximum, walk forward through the
+            # non-zero indices to find the corresponding RIGHT-most
+            # plateau edge. Empirically the right edge gives a more
+            # accurate peak location.
+            all_local_maximums_right = np.zeros(signed.shape, dtype=int)
+            all_local_maximums_right[
+                non_zero_indices[strict_zeroless_maximum_left_indices + 1] - 1
+            ] = 1
+
+            # Weight each peak by its count value so downstream argmax
+            # picks the TALLEST surviving peak, not just the last one.
+            # 'weighting_series' is the raw curve by default, but the
+            # smoothed curve when 'rank_peaks_by_smoothed=True' — see the
+            # docstring for when to enable that.
+            peaks_only_curve_right = (
+                all_local_maximums_right * weighting_series
+            )
+
+            # ── First-peak noise filter ──────────────────────────────
+            # A very common failure mode: a small segmentation-noise
+            # blob creates a briefly-visible extra component early in
+            # the morphology, then vanishes. This shows up as a low,
+            # narrow first peak, a return to count = 1, and then the
+            # real (later) peak. We drop the first peak when all three
+            # conditions are met.
+            peak_indices = np.where(all_local_maximums_right)[0]
+            first_peak_location = peak_indices[0]
+
+            # Condition 1 — first peak lies within ~2 full voxel rounds
+            # (the 'noise-risky' region near step 0).
+            risking_full_pixel_len_threshold = 2
+            risk_threshold = int(
+                np.round(risking_full_pixel_len_threshold / Lambda)
+            )
+            risky_first_peak = first_peak_location <= risk_threshold
+
+            # Condition 2 — after the first peak the count returns to 1
+            # and stays there for at least one full voxel round (i.e.
+            # '~ 1 / Lambda' consecutive samples).
+            find_count_1_after_first_peak = series[peak_indices[0] :] == 1
+
+            if (
+                np.sum(find_count_1_after_first_peak)
+                >= int(np.round(1 / Lambda))
+                and risky_first_peak
+            ):
+                # First step index (in the original series) at which the
+                # count returns to 1 after the first peak.
+                index_first_count_of_1 = (
+                    np.argmax(series[peak_indices[0] :] == 1) + peak_indices[0]
+                )
+
+                # Condition 3 — at least one further peak exists AFTER
+                # the return-to-1 point. If not, the first peak might
+                # still be the real signal, so keep it.
+                peak_check = peak_indices > index_first_count_of_1
+                peak_exist_after_count_returned_to_1 = np.sum(peak_check) >= 1
+
+                if peak_exist_after_count_returned_to_1:
+                    # All three conditions met → discard every peak before the
+                    # return-to-1 point (typically just the noisy first one).
+                    peaks_only_curve_right[peak_indices[~peak_check]] = 0
+
+        # Return the right-most non-zero entry of 'peaks_only_curve_right'
+        # (which is the count value at each surviving peak position, 0
+        # elsewhere). 'np.argmax' on the reversed array picks the tallest,
+        # and ties break rightward.
+        assert len(series) > offset, (
+            'Length of the number array must be larger than offset'
+        )
+        argmax_output = (
+            (
+                len(peaks_only_curve_right[offset:][::-1])
+                - np.argmax(peaks_only_curve_right[offset:][::-1])
+            )
+            - 1
+            + offset
+        )
+
+    except Exception:  # noqa: BLE001 — v2 intentionally returns 0 on any failure
+        argmax_output = 0
+
+    return argmax_output
+
+
+def moving_average(x, w):
+    """
+    Length-preserving moving-average smoother with window size 'w'.
+
+    Uses 'np.convolve' in 'same' mode so the returned array has the
+    same shape as the input — the boundary samples are averaged
+    against implicit zeros, which slightly biases the very first and
+    very last few samples but keeps indices aligned with the raw
+    curve. Used by 'compute_FWHM_v2' to pre-smooth count curves
+    before locating half-maximum crossings.
+    """
+    return np.convolve(x, np.ones(w), 'same') / w
+
+
 def compute_FWHM(series, offset=5):
     """
     Full-width at half-maximum of a count curve, around its peak.
+
+    .. deprecated::
+        Legacy v1 function — no longer used by the napari widget.
+        Kept for backwards compatibility with external callers and as
+        regression coverage for the noise-tolerant replacement,
+        'compute_FWHM_v2'. Prefer v2 for new code.
 
     Finds the peak via function 'find_max_location', then walks outward to the
     contiguous block of samples that lie at or above half-maximum and
@@ -590,9 +839,141 @@ def compute_FWHM(series, offset=5):
     return full_width_half_maximum
 
 
+def compute_FWHM_v2(
+    series, offset=5, Lambda=0.1, rank_peaks_by_smoothed=False
+):
+    """
+    Full-width at half-maximum of a count curve — v2.
+
+    Deliberately mixes RAW and SMOOTHED views of the curve:
+
+    * Peak *location* comes from 'find_max_location_v2', which runs
+      entirely on the raw curve and applies its own noise filter.
+    * Peak *height*, from which the half-max threshold is derived,
+      is read straight off the raw curve at that location — unless
+      'rank_peaks_by_smoothed=True', in which case it is read off the
+      moving-average-smoothed curve for consistency with how the
+      peak was chosen (see 'find_max_location_v2').
+    * The FWHM edges are then found on the MOVING-AVERAGE-SMOOTHED
+      version of the curve — window size 'round(1 / Lambda)', i.e.
+      one full voxel round — so the width is stable against sample-
+      to-sample noise.
+
+    Concretely, with the default 'rank_peaks_by_smoothed=False':
+    half-max = raw peak / 2, and the left / right walks step outward
+    from the peak until the SMOOTHED curve first drops below that
+    raw-derived threshold. With 'rank_peaks_by_smoothed=True': half-max =
+    smoothed peak / 2 and the walks use the same threshold.
+
+    Parameters
+    ----------
+    series: ndarray
+        1D count curve — same input as 'find_max_location_v2'.
+    offset: int, optional
+        Initial samples to skip when locating the peak. Forwarded to
+        'find_max_location_v2'. Default = 5.
+    Lambda: float, optional
+        Subpixel step size in voxel-length units. Sets both the
+        moving-average window ('round(1 / Lambda)' samples ≈ one
+        voxel round) and the noise-filter thresholds used inside
+        'find_max_location_v2'. Default = 0.1.
+    rank_peaks_by_smoothed: bool, optional
+        Forwarded to 'find_max_location_v2' and used locally to pick
+        between the raw and smoothed peak value for the half-max
+        threshold. Default = False.
+
+    Returns
+    -------
+    tuple
+        '(FWHM, (left_half, middle, right_half))' where
+        'FWHM == left_half + middle + right_half', all in step
+        units. The 3-part decomposition exposes the left / right
+        asymmetry of the peak — useful downstream for distinguishing
+        curves with a long left tail from those with a long right
+        tail. On any internal error the tuple is '(0, (0, 0, 0))'.
+
+    Differences vs. 'compute_FWHM' (v1)
+    ----------------------------------
+    * v1 uses 'find_max_location' (global argmax of 'series[offset:]')
+      for the peak and assumes the caller has already Gaussian-
+      smoothed the curve inside 'compute_homology_stats'. v2 uses
+      'find_max_location_v2' (noise-filtered local maxima) and
+      smooths internally with a MOVING AVERAGE whose window is
+      derived from 'Lambda', so the caller can pass a raw curve.
+    * v1 finds the FWHM edges by collecting every above-half-max
+      index in the whole series, splitting them into contiguous
+      runs with 'np.split', and taking the run that contains the
+      peak. v2 walks outward from the peak until the boolean
+      'smoothed >= half_max' mask first turns False, which is
+      simpler, requires no contiguity bookkeeping, and never picks
+      up an above-half-max region belonging to a different peak.
+    * v1 returns a single scalar (the FWHM); v2 returns the FWHM
+      plus a '(left, middle, right)' triple that sums to it.
+    """
+    try:
+        # Moving-average window ≈ one full voxel round. Clamp to at
+        # least 1 to avoid an empty convolution on extreme Lambdas.
+        moving_avg_window_size = int(np.round(1 / Lambda))
+        if moving_avg_window_size == 0:
+            moving_avg_window_size = 1
+
+        # Peak location comes from v2 (noise-filtered on the raw curve;
+        # optionally weighted by the smoothed curve when picking the
+        # tallest local max — see 'find_max_location_v2').
+        max_location = find_max_location_v2(
+            series,
+            offset,
+            Lambda,
+            rank_peaks_by_smoothed=rank_peaks_by_smoothed,
+        )
+
+        # Smooth the whole curve once so both edge walks below see
+        # the same denoised profile.
+        smoothed_series = moving_average(series, w=moving_avg_window_size)
+
+        # Peak height (from which the half-max threshold is derived)
+        # matches whichever curve the peak was chosen on: raw by
+        # default, smoothed when 'rank_peaks_by_smoothed=True'.
+        if rank_peaks_by_smoothed:
+            maximum_count = smoothed_series[max_location]
+        else:
+            maximum_count = series[max_location]
+        half_maximum = maximum_count / 2
+
+        larger_HM_series = smoothed_series >= half_maximum
+
+        # Walk left from the peak until the mask first turns False.
+        # 'argmin' on the reversed slice returns the index of the
+        # first False (False < True), which is the required distance.
+        left_half_max = np.argmin(larger_HM_series[:max_location][::-1])
+        # The peak sample itself always sits above half-max, so we
+        # add 1 for it.
+        middle = 1
+        # Walk right from (and including) the peak; subtract 1 because
+        # 'argmin' returns the position OF the first False whereas we
+        # want the count of True samples strictly before it.
+        right_half_max = np.argmin(larger_HM_series[max_location:]) - 1
+
+        full_width_half_maximum = left_half_max + middle + right_half_max
+
+    except Exception:  # noqa: BLE001 — v2 intentionally returns 0 on any failure
+        full_width_half_maximum = 0
+        left_half_max = 0
+        middle = 0
+        right_half_max = 0
+
+    return full_width_half_maximum, (left_half_max, middle, right_half_max)
+
+
 def compute_homology_stats(series_of_series, offset=5, SIGMA=3):
     """
     Smooth one or more count curves and extract peak + FWHM statistics.
+
+    .. deprecated::
+        Legacy v1 function — no longer used by the napari widget.
+        Kept for backwards compatibility with external callers and as
+        regression coverage for the noise-tolerant replacement,
+        'compute_homology_stats_v2'. Prefer v2 for new code.
 
     Parameters
     ----------
@@ -634,6 +1015,109 @@ def compute_homology_stats(series_of_series, offset=5, SIGMA=3):
     )
 
     return output
+
+
+def compute_homology_stats_v2(
+    series, offset=5, Lambda=0.1, rank_peaks_by_smoothed=False
+):
+    """
+    Extract peak + FWHM statistics from a single count curve — v2.
+
+    Wraps 'find_max_location_v2' (noise-tolerant peak detection on
+    the RAW curve) and 'compute_FWHM_v2' (raw peak height + FWHM
+    edges walked on a moving-average-smoothed curve), then converts
+    the step-unit results into voxel units by multiplying by
+    'Lambda' — so the caller receives numbers that are directly
+    interpretable as voxel-length quantities.
+
+    See each helper's docstring for the exact raw / smoothed split.
+
+    This is the version the napari widget calls; the widget passes
+    the raw count curve straight in and displays the returned
+    voxel-unit values.
+
+    Parameters
+    ----------
+    series: ndarray
+        A single 1D count curve (object or hole count as a function
+        of subpixel-step).
+    offset: int, optional
+        Initial samples to skip when locating the peak. Forwarded to
+        the v2 helpers. Default = 5.
+    Lambda: float, optional
+        Subpixel step size in voxel-length units. Governs the
+        moving-average window ('round(1 / Lambda)') and the noise
+        thresholds inside 'find_max_location_v2', and provides the
+        step-to-voxel scaling for the returned values. Default = 0.1.
+    rank_peaks_by_smoothed: bool, optional
+        Forwarded to both v2 helpers. When True, the argmax that
+        picks the "tallest" surviving local maximum ranks candidates
+        by their moving-average smoothed value instead of their raw
+        count (and 'maximum_count' returned below is likewise read
+        off the smoothed curve). Candidate identification and the
+        noise filter still run on the raw curve — see
+        'find_max_location_v2' for the exact split. Default = False.
+
+    Returns
+    -------
+    tuple
+        '(FWHM_vox, max_location_vox, maximum_count)':
+        * 'FWHM_vox' — full-width at half-maximum, in voxel units.
+        * 'max_location_vox' — peak location, in voxel units.
+        * 'maximum_count' — the raw count value at the peak (no
+          conversion, since it is already a dimensionless count).
+
+        On an internal failure inside the v2 helpers, the two
+        distance values become 0.0 (since v2 falls back to a
+        step-index of 0), and the caller should treat this as a
+        degenerate curve.
+
+    Differences vs. 'compute_homology_stats' (v1)
+    --------------------------------------------
+    * v1 accepts a SEQUENCE of curves and returns an 'ndarray(3, N)';
+      v2 processes a single curve and returns a plain tuple. Both
+      the widget and the paper's own downstream code only ever
+      analyse one curve at a time, so v2 avoids the collection
+      bookkeeping.
+    * v1 requires a 'SIGMA' argument and pre-smooths each curve
+      with a Gaussian filter. v2 has no 'SIGMA' — the smoothing is
+      a moving average sized by 'Lambda' and lives inside
+      'compute_FWHM_v2'.
+    * v1 returns FWHM and max-location in RAW STEP UNITS; the
+      caller has to divide by 'ceil(1 / Lambda)' to get voxels. v2
+      does the conversion internally so the caller works only in
+      voxel units.
+    * v1 uses the older peak / FWHM helpers ('find_max_location',
+      'compute_FWHM') and inherits their noise sensitivity. v2 uses
+      the noise-tolerant v2 helpers.
+    """
+    # 'FWHM_left', 'FWHM_middle', 'FWHM_right' are the three pieces
+    # that sum to 'FWHM'. We only need the aggregate here, but the
+    # tuple is destructured to make the intent explicit and to leave
+    # a hook for callers that want the left / right asymmetry.
+    FWHM, (FWHM_left, FWHM_middle, FWHM_right) = compute_FWHM_v2(
+        series, offset, Lambda, rank_peaks_by_smoothed=rank_peaks_by_smoothed
+    )
+    max_location = find_max_location_v2(
+        series, offset, Lambda, rank_peaks_by_smoothed=rank_peaks_by_smoothed
+    )
+
+    # Peak height reported to the caller: raw by default (matches the
+    # original Chenhao v2 return), smoothed when the caller opted in
+    # to smoothed-based peak selection.
+    if rank_peaks_by_smoothed:
+        smooth_window = max(1, int(np.round(1 / Lambda)))
+        smoothed_series = moving_average(series, w=smooth_window)
+        maximum_count = smoothed_series[max_location]
+    else:
+        maximum_count = series[max_location]
+
+    # Convert step-unit values back to voxel units
+    # ('step_index * Lambda' = voxel-length).
+    FWHM_vox = FWHM * Lambda
+    max_location_vox = max_location * Lambda
+
+    return FWHM_vox, max_location_vox, maximum_count
 
 
 ##############################################################################

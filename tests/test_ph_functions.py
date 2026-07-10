@@ -3,11 +3,15 @@ import pytest
 
 from napari_persistent_homology.ph_functions import (
     compute_FWHM,
+    compute_FWHM_v2,
     compute_homology_stats,
+    compute_homology_stats_v2,
     find_max_location,
+    find_max_location_v2,
     gaussian_average,
     hole_count,
     holes_count_internal_object,
+    moving_average,
     object_count,
     persistent_homology_dilation,
     persistent_homology_dilation_internal_object,
@@ -426,3 +430,246 @@ class TestStepCallback:
             self._make_blob(), max_steps=3, Lambda=0.5, Connectivity=26
         )
         assert len(obj) == 4  # step 0 + 3 steps
+
+
+# ---------------------------------------------------------------------------
+# v2 helpers for the feature-extraction tests
+# ---------------------------------------------------------------------------
+
+
+def _noise_spike_then_broad_peak(length=60):
+    """Curve modelled after the failure case observed on real hole-count
+    data: a narrow, high early spike followed (after a small dip that
+    does NOT drop back to count = 1 for 10 samples) by a broad, slightly
+    lower main peak. Under default v2 ('rank_peaks_by_smoothed=False'),
+    the spike wins the argmax; under the smoothed variant, the broad
+    peak wins because averaging dilutes the spike."""
+    series = np.zeros(length, dtype=float)
+    # Narrow raw spike near step 12 — value 8, one sample wide.
+    series[10] = 3.0
+    series[11] = 5.0
+    series[12] = 8.0
+    series[13] = 4.0
+    series[14] = 3.0
+    # Sustained mid-region around count = 2..3 so the noise filter's
+    # 'count = 1 for >= 1/Lambda samples' condition does NOT fire.
+    series[15:22] = np.array([3.0, 3.0, 3.0, 4.0, 4.0, 4.0, 5.0])
+    # Broad main peak centred near step 30, height 7.
+    x = np.arange(length, dtype=float)
+    series += 7.0 * np.exp(-0.5 * ((x - 30) / 4.0) ** 2)
+    return series
+
+
+# ---------------------------------------------------------------------------
+# find_max_location_v2  (noise-tolerant, used by the widget)
+# ---------------------------------------------------------------------------
+
+
+class TestFindMaxLocationV2:
+    def test_peak_at_known_location(self):
+        # Single clean peak — v2 should find it exactly like v1.
+        series = np.zeros(30, dtype=float)
+        series[8:14] = np.array([1.0, 3.0, 5.0, 4.0, 2.0, 1.0])
+        assert find_max_location_v2(series, offset=5, Lambda=0.1) == 10
+
+    def test_peak_before_offset_is_ignored(self):
+        # A peak inside the 'offset' window must not be returned.
+        series = np.zeros(30, dtype=float)
+        series[2] = 10.0  # inside offset region
+        series[15:18] = np.array([3.0, 5.0, 2.0])  # real peak
+        assert find_max_location_v2(series, offset=5, Lambda=0.1) == 16
+
+    def test_local_max_wins_over_earlier_smaller_local_max(self):
+        # Two clean local maxima — the tallest wins, not just the last.
+        series = np.zeros(50, dtype=float)
+        series[10:14] = np.array([2.0, 4.0, 2.0, 1.0])  # smaller
+        series[25:29] = np.array([3.0, 6.0, 3.0, 1.0])  # taller
+        assert find_max_location_v2(series, offset=5, Lambda=0.1) == 26
+
+    def test_noise_filter_discards_first_peak(self):
+        # Textbook noise pattern that the filter is designed to catch:
+        # small early peak → sustained count = 1 for >= 1/Lambda samples
+        # → later real peak. v2 must return the LATER peak.
+        series = np.zeros(50, dtype=float)
+        series[7:10] = np.array([1.0, 2.0, 1.0])  # small early peak
+        series[10:22] = 1.0  # stable count = 1 for 12 samples (>= 10)
+        series[25:29] = np.array([3.0, 5.0, 3.0, 1.0])  # real peak
+        assert find_max_location_v2(series, offset=5, Lambda=0.1) == 26
+
+    def test_noise_filter_leaves_curve_alone_without_count_1_plateau(self):
+        # This is the observed real-data failure mode: the raw noise
+        # spike is TALLER than the true structural peak and the count
+        # never returns to 1 between them, so v2's noise filter does
+        # not fire. Default weighting (raw) picks the spike.
+        series = _noise_spike_then_broad_peak()
+        raw_pick = find_max_location_v2(series, offset=5, Lambda=0.1)
+        # The spike sits at step 12 — one of the samples 10..14.
+        assert raw_pick in (11, 12, 13)
+
+    def test_rank_peaks_by_smoothed_picks_main_peak_over_spike(self):
+        # Same curve; enabling smoothed weighting must push argmax onto
+        # the broad main peak near step 30 instead of the narrow spike.
+        series = _noise_spike_then_broad_peak()
+        smoothed_pick = find_max_location_v2(
+            series, offset=5, Lambda=0.1, rank_peaks_by_smoothed=True
+        )
+        assert abs(smoothed_pick - 30) <= 3
+
+    def test_flat_curve_returns_valid_step_index_without_crashing(self):
+        # A completely flat curve has no meaningful peak, but v2 still
+        # walks the degenerate branch to a definite answer. The point
+        # of this check is that v2 does not raise on such input — the
+        # returned step lives inside the post-offset range so it stays
+        # a valid index for downstream lookups.
+        series = np.zeros(30, dtype=float)
+        step = find_max_location_v2(series, offset=5, Lambda=0.1)
+        assert 5 <= step < len(series)
+
+
+# ---------------------------------------------------------------------------
+# compute_FWHM_v2  (returns a tuple: total + (left, middle, right))
+# ---------------------------------------------------------------------------
+
+
+class TestComputeFWHMV2:
+    def test_returns_tuple_shape(self):
+        # (total, (left, middle, right)) — three-piece decomposition.
+        series = gaussian_peak(length=100, centre=50, sigma=5)
+        result = compute_FWHM_v2(series, offset=5, Lambda=0.1)
+        total, parts = result
+        assert isinstance(total, (int, float, np.integer, np.floating))
+        assert isinstance(parts, tuple)
+        assert len(parts) == 3
+
+    def test_parts_sum_to_total(self):
+        # The whole-vs-parts contract: left + middle + right == FWHM.
+        series = gaussian_peak(length=100, centre=50, sigma=5)
+        total, (left, middle, right) = compute_FWHM_v2(
+            series, offset=5, Lambda=0.1
+        )
+        assert left + middle + right == total
+
+    def test_middle_is_one(self):
+        # 'middle' is the peak sample itself — always 1 by construction.
+        series = gaussian_peak(length=100, centre=50, sigma=5)
+        _, (_, middle, _) = compute_FWHM_v2(series, offset=5, Lambda=0.1)
+        assert middle == 1
+
+    def test_narrower_peak_gives_smaller_fwhm(self):
+        # Sanity: a taller / narrower peak has a smaller FWHM in step
+        # units than a wider one, regardless of the exact algorithm.
+        narrow = gaussian_peak(length=100, centre=50, sigma=3)
+        wide = gaussian_peak(length=100, centre=50, sigma=8)
+        narrow_fwhm, _ = compute_FWHM_v2(narrow, offset=5, Lambda=0.1)
+        wide_fwhm, _ = compute_FWHM_v2(wide, offset=5, Lambda=0.1)
+        assert narrow_fwhm < wide_fwhm
+
+    def test_gaussian_peak_fwhm_within_analytical_range(self):
+        # Analytical FWHM of a Gaussian with sigma = 5 is
+        # 2 * 5 * sqrt(2 ln 2) ~ 11.77 samples. v2's moving-average
+        # pre-smoothing widens it slightly, so allow a generous
+        # tolerance.
+        series = gaussian_peak(length=100, centre=50, sigma=5)
+        total, _ = compute_FWHM_v2(series, offset=5, Lambda=0.1)
+        assert 8 <= total <= 22
+
+    def test_flat_curve_returns_zero_total_without_crashing(self):
+        # A completely flat curve has no meaningful width; only the
+        # aggregate 'total' being 0 is contractual. The individual
+        # (left, middle, right) parts can legitimately end up as
+        # (0, 1, -1) — 'middle' is always 1 (the peak sample) and
+        # 'right_half_max = argmin(...) - 1' walks off the end into
+        # -1 when the whole mask is True. That's an intended quirk of
+        # v2's argmin-based walk, not a bug.
+        series = np.zeros(30, dtype=float)
+        total, _ = compute_FWHM_v2(series, offset=5, Lambda=0.1)
+        assert total == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_homology_stats_v2  (single-series API, voxel-unit output)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeHomologyStatsV2:
+    def test_returns_three_tuple(self):
+        series = gaussian_peak(length=100, centre=50, sigma=5)
+        result = compute_homology_stats_v2(series, offset=5, Lambda=0.1)
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+
+    def test_output_in_voxel_units(self):
+        # v2 multiplies step-unit results by Lambda internally, so
+        # 'max_location_vox' should equal the step index * Lambda.
+        # A clean peak at step 30 with Lambda = 0.1 → 3.0 voxels.
+        series = np.zeros(60, dtype=float)
+        series[27:33] = np.array([1.0, 3.0, 5.0, 4.0, 2.0, 1.0])
+        _, max_loc_vox, _ = compute_homology_stats_v2(
+            series, offset=5, Lambda=0.1
+        )
+        assert max_loc_vox == pytest.approx(29 * 0.1)
+
+    def test_max_location_scales_with_lambda(self):
+        # Same step-index peak but a different Lambda should scale the
+        # reported voxel-unit location proportionally, since the return
+        # value is step_index * Lambda.
+        series = np.zeros(60, dtype=float)
+        series[27:33] = np.array([1.0, 3.0, 5.0, 4.0, 2.0, 1.0])
+        _, loc_lam_01, _ = compute_homology_stats_v2(
+            series, offset=5, Lambda=0.1
+        )
+        _, loc_lam_02, _ = compute_homology_stats_v2(
+            series, offset=5, Lambda=0.2
+        )
+        # Both should point at the same step index (29), so the voxel
+        # values must differ by a factor of 2.
+        assert loc_lam_02 == pytest.approx(2 * loc_lam_01, rel=0.01)
+
+    def test_maximum_count_is_raw_by_default(self):
+        # Default 'rank_peaks_by_smoothed=False': the reported
+        # 'maximum_count' is the RAW series value at the peak.
+        series = np.zeros(60, dtype=float)
+        series[27:33] = np.array([1.0, 3.0, 5.0, 4.0, 2.0, 1.0])
+        _, _, max_count = compute_homology_stats_v2(
+            series, offset=5, Lambda=0.1
+        )
+        assert max_count == 5.0
+
+    def test_rank_peaks_by_smoothed_flag_shifts_max_location(self):
+        # On a curve with a raw noise spike beating the true main peak,
+        # enabling 'rank_peaks_by_smoothed' must move the reported
+        # peak away from the spike.
+        series = _noise_spike_then_broad_peak()
+        _, raw_loc_vox, _ = compute_homology_stats_v2(
+            series, offset=5, Lambda=0.1, rank_peaks_by_smoothed=False
+        )
+        _, smooth_loc_vox, _ = compute_homology_stats_v2(
+            series, offset=5, Lambda=0.1, rank_peaks_by_smoothed=True
+        )
+        # The spike is around step 12 (voxel 1.2); the broad main peak
+        # is around step 30 (voxel 3.0). The two flags should point at
+        # opposite ends of the curve.
+        assert raw_loc_vox < 2.0
+        assert smooth_loc_vox > 2.5
+
+    def test_maximum_count_from_smoothed_when_flag_set(self):
+        # When the smoothed-weighting flag is enabled, 'maximum_count'
+        # must come from the smoothed curve at the chosen step — not
+        # the raw curve.
+        series = _noise_spike_then_broad_peak()
+        _, _, smooth_max_count = compute_homology_stats_v2(
+            series, offset=5, Lambda=0.1, rank_peaks_by_smoothed=True
+        )
+        # Independently recompute what the smoothed value at the
+        # chosen step is, using the same moving-average window that
+        # v2 uses internally.
+        window = int(round(1 / 0.1))
+        smoothed = moving_average(series, w=window)
+        step = int(
+            round(
+                find_max_location_v2(
+                    series, offset=5, Lambda=0.1, rank_peaks_by_smoothed=True
+                )
+            )
+        )
+        assert smooth_max_count == pytest.approx(smoothed[step], rel=1e-6)

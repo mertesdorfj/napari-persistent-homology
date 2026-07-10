@@ -72,8 +72,8 @@ def _fake_completed_run(widget, mode_text=None):
         'Lambda': 0.1,
         'max_steps': 100,
         'connectivity': 26,
-        'SIGMA': 5.0,
         'offset': 5,
+        'rank_peaks_by_smoothed': False,
         'unit': 'vox',
         'vx': 0.0,
         'vy': 0.0,
@@ -81,7 +81,7 @@ def _fake_completed_run(widget, mode_text=None):
     }
     series = np.zeros(101)
     series[40:60] = 5.0
-    widget._on_result((series, 5.0, 2.0, 'Object count', 5.0))
+    widget._on_result((series, 5.0, 2.0, 'Object count'))
 
 
 def _read_csv_rows(path):
@@ -234,8 +234,9 @@ def test_parameter_defaults_and_lambda_offset_linkage(make_napari_viewer):
     assert widget._lambda_spin.value() == 0.1
     assert widget._lambda_spin.minimum() == 0.1
 
-    # Sigma: default 3.0 (was 5.0 in earlier releases).
-    assert widget._sigma_spin.value() == 3.0
+    # Sigma spinbox was removed when the analysis switched to v2 (which
+    # smooths internally with a Lambda-derived moving average).
+    assert not hasattr(widget, '_sigma_spin')
 
     # Offset: default = ceil(1 / Lambda) = 10 at the default Lambda.
     assert widget._offset_spin.value() == 10
@@ -577,8 +578,8 @@ def test_result_label_shows_physical_first_voxels_in_brackets(
         'Lambda': 0.1,
         'max_steps': 100,
         'connectivity': 26,
-        'SIGMA': 5.0,
         'offset': 5,
+        'rank_peaks_by_smoothed': False,
         'unit': 'nm',
         'vx': 5.0,
         'vy': 5.0,
@@ -587,7 +588,7 @@ def test_result_label_shows_physical_first_voxels_in_brackets(
     # Synthetic non-degenerate count curve so the result path runs
     series = np.zeros(101)
     series[40:60] = 5.0
-    fake_result = (series, 5.0, 2.0, 'Object count', 5.0)
+    fake_result = (series, 5.0, 2.0, 'Object count')
     widget._on_result(fake_result)
 
     # Physical value is reported first, voxel value in brackets
@@ -610,8 +611,8 @@ def test_result_label_voxel_only_when_unit_is_vox(make_napari_viewer):
         'Lambda': 0.1,
         'max_steps': 100,
         'connectivity': 26,
-        'SIGMA': 5.0,
         'offset': 5,
+        'rank_peaks_by_smoothed': False,
         'unit': 'vox',
         'vx': 0.0,
         'vy': 0.0,
@@ -619,7 +620,7 @@ def test_result_label_voxel_only_when_unit_is_vox(make_napari_viewer):
     }
     series = np.zeros(101)
     series[40:60] = 5.0
-    fake_result = (series, 5.0, 2.0, 'Object count', 5.0)
+    fake_result = (series, 5.0, 2.0, 'Object count')
     widget._on_result(fake_result)
 
     assert widget._radius_label.text() == '5.00 vox'
@@ -638,7 +639,7 @@ def test_completion_status_includes_analysis_mode(make_napari_viewer):
     # completion path.
     series = np.zeros(101)
     series[40:60] = 5.0
-    fake_result = (series, 5.0, 2.0, 'Object count', 5.0)
+    fake_result = (series, 5.0, 2.0, 'Object count')
 
     cases = [
         (_MODE_EROSION, 'Object radius / half-thickness'),
@@ -651,8 +652,8 @@ def test_completion_status_includes_analysis_mode(make_napari_viewer):
             'Lambda': 0.1,
             'max_steps': 100,
             'connectivity': 26,
-            'SIGMA': 5.0,
             'offset': 5,
+            'rank_peaks_by_smoothed': False,
             'unit': 'vox',
             'vx': 0.0,
             'vy': 0.0,
@@ -680,8 +681,8 @@ def test_degenerate_curve_shows_no_peak_error(make_napari_viewer):
         'Lambda': 0.1,
         'max_steps': 100,
         'connectivity': 26,
-        'SIGMA': 5.0,
         'offset': 5,
+        'rank_peaks_by_smoothed': False,
         'unit': 'vox',
         'vx': 0.0,
         'vy': 0.0,
@@ -692,7 +693,7 @@ def test_degenerate_curve_shows_no_peak_error(make_napari_viewer):
     # offset-fallback radius (0.5) and full-curve FWHM (10.0) that
     # find_max_location / compute_FWHM produce on a flat curve.
     series = np.zeros(101)
-    fake_result = (series, 0.5, 10.0, 'Object count', 5.0)
+    fake_result = (series, 0.5, 10.0, 'Object count')
     widget._on_result(fake_result)
 
     text = widget._status_label.text()

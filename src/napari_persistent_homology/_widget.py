@@ -37,6 +37,7 @@ from napari.qt.threading import thread_worker
 from napari.viewer import Viewer
 from qtpy.QtCore import QObject, Qt, Signal
 from qtpy.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -65,8 +66,8 @@ except ImportError:
 from matplotlib.figure import Figure
 
 from .ph_functions import (
-    compute_homology_stats,
-    gaussian_average,
+    compute_homology_stats_v2,
+    moving_average,
     persistent_homology_dilation,
     persistent_homology_dilation_internal_object,
     persistent_homology_erosion,
@@ -134,8 +135,8 @@ def _run_analysis(
     Lambda: float,
     max_steps: int,
     connectivity: int,
-    SIGMA: float,
     offset: int,
+    rank_peaks_by_smoothed: bool,
     step_callback,
 ):
     """
@@ -144,7 +145,7 @@ def _run_analysis(
     Dispatches to one of the three analysis functions in 'ph_functions.py'
     based on 'mode_key', picks the relevant count curve (object-count for
     erosion, hole-count for the two dilation variants), and reduces it to
-    two scalar shape descriptors using 'compute_homology_stats'.
+    two scalar shape descriptors using 'compute_homology_stats_v2'.
 
     Parameters
     ----------
@@ -158,8 +159,18 @@ def _run_analysis(
     Lambda, max_steps, connectivity:
         Forwarded to the underlying persistent-homology function. See
         'ph_functions.persistent_homology_*' for details.
-    SIGMA, offset:
-        Forwarded to 'compute_homology_stats' for smoothing and peak finding.
+    offset:
+        Initial samples to skip when locating the peak — forwarded to
+        'compute_homology_stats_v2'.
+    rank_peaks_by_smoothed: bool
+        Optional v2 flag forwarded to 'compute_homology_stats_v2'.
+        When True, the argmax that picks the tallest surviving
+        local maximum ranks candidates by their moving-average
+        smoothed value instead of the raw count. Candidate
+        identification and the noise filter still run on the raw
+        curve. Useful on noisy data where a single-sample raw spike
+        would otherwise win the argmax; has no visible effect on
+        curves with only one clear peak (typical erosion).
     step_callback: callable
         Per-step progress reporter, normally
         '_ProgressEmitter.step'.
@@ -167,11 +178,10 @@ def _run_analysis(
     Returns
     -------
     tuple
-        '(series, radius_vox, fwhm_vox, curve_label, SIGMA)' where 'series'
-        is the raw count curve, 'radius_vox' / 'fwhm_vox' are the peak
-        location and full-width-at-half-maximum converted from subpixel-step
-        units to voxel units (divided by 'ceil(1 / Lambda)'), and
-        'curve_label' is a string for the plot legend.
+        '(series, radius_vox, fwhm_vox, curve_label)' where 'series' is
+        the raw count curve, and 'radius_vox' / 'fwhm_vox' are the peak
+        location and full-width-at-half-maximum already converted to
+        voxel units by 'compute_homology_stats_v2'.
     """
     from napari.utils import progress
 
@@ -210,12 +220,17 @@ def _run_analysis(
             series = hole_counts
             curve_label = 'Hole count (internal)'
 
-    stats = compute_homology_stats([series], offset=offset, SIGMA=SIGMA)
-    # stats shape: (3, 1)  ->  [FWHM, max_count, max_location]
-    scale = int(ceil(1.0 / Lambda))
-    radius_vox = float(stats[2, 0]) / scale
-    fwhm_vox = float(stats[0, 0]) / scale
-    return series, radius_vox, fwhm_vox, curve_label, SIGMA
+    # v2 returns (FWHM, max_location, max_count) already in voxel units
+    # (multiplied by Lambda), with internal noise-tolerant peak detection.
+    # 'rank_peaks_by_smoothed' picks between raw / smoothed weighting when
+    # choosing the tallest local peak — see 'find_max_location_v2'.
+    fwhm_vox, radius_vox, _max_count = compute_homology_stats_v2(
+        series,
+        offset=offset,
+        Lambda=Lambda,
+        rank_peaks_by_smoothed=rank_peaks_by_smoothed,
+    )
+    return series, float(radius_vox), float(fwhm_vox), curve_label
 
 
 ##############################################################################
@@ -494,18 +509,17 @@ class PersistentHomologyWidget(QWidget):
             3,
         )
 
-        # Sigma
-        self._sigma_spin = QDoubleSpinBox()
-        self._sigma_spin.setRange(0.1, 20.0)
-        self._sigma_spin.setSingleStep(0.1)
-        self._sigma_spin.setValue(3.0)
-        self._sigma_spin.setDecimals(1)
-        self._sigma_spin.setMaximumWidth(_SPIN_WIDTH)
-        adv_grid.addWidget(QLabel('Sigma:'), 2, 0)
-        adv_grid.addWidget(self._sigma_spin, 2, 1)
+        # Offset
+        self._offset_spin = QSpinBox()
+        self._offset_spin.setRange(0, 20)
+        self._offset_spin.setValue(int(ceil(1.0 / self._lambda_spin.value())))
+        self._offset_spin.setMaximumWidth(_SPIN_WIDTH)
+        adv_grid.addWidget(QLabel('Offset:'), 2, 0)
+        adv_grid.addWidget(self._offset_spin, 2, 1)
         adv_grid.addWidget(
             _desc(
-                'Gaussian smoothing of the count curve before peak detection.'
+                'Auto-set to int(1 / Lambda) (one full voxel layer); '
+                'recommended to leave unchanged.'
             ),
             3,
             0,
@@ -513,17 +527,26 @@ class PersistentHomologyWidget(QWidget):
             3,
         )
 
-        # Offset
-        self._offset_spin = QSpinBox()
-        self._offset_spin.setRange(0, 20)
-        self._offset_spin.setValue(int(ceil(1.0 / self._lambda_spin.value())))
-        self._offset_spin.setMaximumWidth(_SPIN_WIDTH)
-        adv_grid.addWidget(QLabel('Offset:'), 4, 0)
-        adv_grid.addWidget(self._offset_spin, 4, 1)
+        # Argmax weighting on smoothed values — off by default (matches
+        # Chenhao's original v2). Local-max identification still runs on
+        # the raw curve; this flag only changes which candidate wins
+        # the "tallest" argmax by ranking them via the moving-average
+        # smoothed curve rather than the raw counts. Prevents a single-
+        # sample noise spike from winning; has no visible effect on
+        # curves that expose only one local maximum (typical erosion
+        # object-count curves).
+        self._rank_peaks_by_smoothed_check = QCheckBox(
+            'Rank peaks by smoothed value'
+        )
+        self._rank_peaks_by_smoothed_check.setChecked(False)
+        adv_grid.addWidget(self._rank_peaks_by_smoothed_check, 4, 0, 1, 3)
         adv_grid.addWidget(
             _desc(
-                'Auto-set to int(1 / Lambda) (one full voxel layer); '
-                'recommended to leave unchanged.'
+                'When enabled, the tallest peak is picked by ranking '
+                'candidates on the moving-average smoothed curve '
+                'instead of the raw count. Prevents a single-sample '
+                'noise spike from winning the argmax; has no visible '
+                'effect on curves with only one clear peak.'
             ),
             5,
             0,
@@ -898,8 +921,8 @@ class PersistentHomologyWidget(QWidget):
         Lambda = self._lambda_spin.value()
         max_steps = self._max_steps_spin.value()
         connectivity = int(self._connectivity_combo.currentText())
-        SIGMA = self._sigma_spin.value()
         offset = self._offset_spin.value()
+        rank_peaks_by_smoothed = self._rank_peaks_by_smoothed_check.isChecked()
         # 'unit' was already read above for the physical-scale check
 
         self._run_params = {
@@ -907,8 +930,8 @@ class PersistentHomologyWidget(QWidget):
             'Lambda': Lambda,
             'max_steps': max_steps,
             'connectivity': connectivity,
-            'SIGMA': SIGMA,
             'offset': offset,
+            'rank_peaks_by_smoothed': rank_peaks_by_smoothed,
             'unit': unit,
             'vx': self._vx_spin.value(),
             'vy': self._vy_spin.value(),
@@ -926,8 +949,8 @@ class PersistentHomologyWidget(QWidget):
             Lambda,
             max_steps,
             connectivity,
-            SIGMA,
             offset,
+            rank_peaks_by_smoothed,
             self._progress_emitter.step,
         )
         worker.returned.connect(self._on_result)
@@ -1001,23 +1024,29 @@ class PersistentHomologyWidget(QWidget):
         Degenerate input (count curve never rises above zero — typically
         when the algorithm finds no measurable signal) is detected here
         and reported as 'No peak detected — count curve is empty' rather
-        than displaying the misleading offset-fallback values that
-        'find_max_location' produces on a flat curve.
+        than displaying the meaningless '0' fallback that
+        'compute_homology_stats_v2' returns on such curves.
         """
-        series, radius_vox, fwhm_vox, curve_label, SIGMA = result
+        series, radius_vox, fwhm_vox, curve_label = result
 
         p = self._run_params
 
-        # Degenerate curve: 'find_max_location' falls back to returning the
-        # offset value when the post-offset series is all zero, and
-        # 'compute_FWHM' returns the full curve width on a flat curve. The
-        # reported radius / FWHM are therefore not real measurements — show
-        # a clear error and clear the result widgets instead.
-        scale = int(ceil(1.0 / p['Lambda']))
-        max_location_step = int(round(radius_vox * scale))
-        smoothed = gaussian_average(series, sigma=SIGMA)
+        # For plot rendering: the smoothed curve mirrors what v2 uses
+        # internally when computing FWHM (moving average over one full
+        # voxel round). The peak step index is derived from 'radius_vox'
+        # by dividing by 'Lambda' — v2 returned it multiplied by Lambda
+        # to get voxel units.
+        smooth_window = max(1, int(round(1.0 / p['Lambda'])))
+        smoothed = moving_average(series, w=smooth_window)
+        max_location_step = int(round(radius_vox / p['Lambda']))
+
+        # Degenerate curve: v2 falls back to '0' on empty / flat curves.
+        # Detect either that fallback or a peak step that lies outside a
+        # meaningful part of the curve, and report an explicit error
+        # instead of displaying misleading zeros.
         if (
-            max_location_step >= len(smoothed)
+            (radius_vox == 0.0 and fwhm_vox == 0.0)
+            or max_location_step >= len(smoothed)
             or smoothed[max_location_step] == 0
         ):
             self._reset_results()
@@ -1211,8 +1240,8 @@ class PersistentHomologyWidget(QWidget):
                 f'# Parameters: lambda={p["Lambda"]}, '
                 f'max_steps={p["max_steps"]}, '
                 f'connectivity={p["connectivity"]}, '
-                f'sigma={p["SIGMA"]}, '
-                f'offset={p["offset"]}'
+                f'offset={p["offset"]}, '
+                f'rank_peaks_by_smoothed={p["rank_peaks_by_smoothed"]}'
             ]
         )
         if unit != 'vox' and min(p['vx'], p['vy'], p['vz']) > 0:
