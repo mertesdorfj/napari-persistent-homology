@@ -9,6 +9,9 @@ contributions:
     - id: napari-persistent-homology.cristae_binary_mask_3d
       python_name: napari_persistent_homology._sample_data:load_cristae_binary_mask_3d
       title: Load cristae binary mask 3D
+    - id: napari-persistent-homology.cristae_multi_label_mask_3d
+      python_name: napari_persistent_homology._sample_data:load_cristae_multi_label_mask_3d
+      title: Load cristae multi-label mask 3D
   widgets:
     - command: napari-persistent-homology.make_widget
       display_name: Persistent Homology
@@ -16,6 +19,9 @@ contributions:
     - command: napari-persistent-homology.cristae_binary_mask_3d
       display_name: Cristae binary mask 3D
       key: cristae_binary_mask_3d
+    - command: napari-persistent-homology.cristae_multi_label_mask_3d
+      display_name: Cristae multi-label mask 3D
+      key: cristae_multi_label_mask_3d
   menus:
     napari/layers/measure:
       - command: napari-persistent-homology.make_widget
