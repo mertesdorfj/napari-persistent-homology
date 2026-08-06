@@ -57,6 +57,94 @@ from tqdm import tqdm
 from .subpixel_morphology import subpixel_dilation_3D, subpixel_erosion_3D
 
 ##############################################################################
+# Per-object sub-volume extraction
+#
+# Helpers for the widget's per-object analysis mode: isolate one label from a
+# multi-label mask and crop it (and, optionally, an aligned container mask) to
+# its bounding box before running the persistent-homology pipeline. The
+# analysis functions pad their input internally, so a tight foreground crop is
+# safe — enclosed holes lie inside the bounding box, while the outer
+# background that 'hole_count' subtracts is outside it and irrelevant.
+##############################################################################
+
+
+def bounding_box_crop(mask):
+    """Crop a mask to the bounding box of its nonzero voxels.
+
+    Parameters
+    ----------
+    mask: ndarray
+        3D array; nonzero voxels are treated as foreground.
+
+    Returns
+    -------
+    cropped: ndarray
+        The smallest sub-array containing every nonzero voxel of 'mask',
+        with the same dtype.
+    bbox: tuple of int
+        '(z0, y0, x0, z1, y1, x1)' — the half-open bounds such that
+        'mask[z0:z1, y0:y1, x0:x1]' equals 'cropped'.
+
+    Raises
+    ------
+    ValueError
+        If 'mask' has no nonzero voxels (an empty bounding box).
+    """
+    nonzero = np.argwhere(mask)
+    if nonzero.size == 0:
+        raise ValueError('Cannot crop an empty mask (no nonzero voxels).')
+    z0, y0, x0 = nonzero.min(axis=0)
+    z1, y1, x1 = nonzero.max(axis=0) + 1
+    bbox = (int(z0), int(y0), int(x0), int(z1), int(y1), int(x1))
+    return mask[z0:z1, y0:y1, x0:x1], bbox
+
+
+def label_subvolume(label_data, label_id, container_data=None):
+    """Extract a single label as a cropped binary sub-volume.
+
+    Builds the binary mask '(label_data == label_id)', crops it to its
+    bounding box, and — when 'container_data' is given — crops the container
+    to the *same* bounding box so the two stay voxel-aligned for the
+    internal-spacing analysis.
+
+    Parameters
+    ----------
+    label_data: ndarray
+        3D integer label volume.
+    label_id: int
+        The label value to isolate.
+    container_data: ndarray or None
+        Optional container / parent mask of identical shape. Cropped to the
+        same bounding box and binarized when provided.
+
+    Returns
+    -------
+    obj_mask: ndarray of uint8
+        The isolated label, cropped, values in {0, 1}.
+    container_mask: ndarray of uint8 or None
+        The container cropped to the same bbox (binarized), or None when no
+        container was supplied.
+    bbox: tuple of int
+        '(z0, y0, x0, z1, y1, x1)' bounding box in the original volume.
+
+    Raises
+    ------
+    ValueError
+        If 'label_id' is absent from 'label_data'.
+    """
+    obj_mask, bbox = bounding_box_crop(label_data == label_id)
+    obj_mask = obj_mask.astype(np.uint8)
+
+    container_mask = None
+    if container_data is not None:
+        z0, y0, x0, z1, y1, x1 = bbox
+        container_mask = (container_data[z0:z1, y0:y1, x0:x1] > 0).astype(
+            np.uint8
+        )
+    return obj_mask, container_mask, bbox
+
+
+##############################################################################
 # Counting components and holes
 #
 # Wrappers around 'cc3d.connected_components' that count either foreground

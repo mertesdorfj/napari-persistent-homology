@@ -22,3 +22,15 @@ repos:
   #   rev: v1.19.0
   #   hooks:
   #     - id: mypy
+
+  # Run the test suite before every push (kept off the commit step so commits stay fast).
+  # Enable with: pre-commit install --hook-type pre-push   (run pytest from the repo's conda env)
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (pre-push)
+        entry: python -m pytest -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

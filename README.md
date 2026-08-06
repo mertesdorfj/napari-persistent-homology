@@ -88,7 +88,7 @@ The plugin requires Python ≥ 3.10.
 3. Load a 3D binary segmentation (your own `.tif` / `.npy` file, or the bundled sample under **File → Open Sample → Cristae binary mask 3D (Persistent Homology 3D)**).
 4. Choose an analysis mode and click **Run Analysis**.
 5. Inspect the count curve and the resulting measurements (radius / spacing and the full-width at half-maximum, FWHM) in the **Results** section.
-6. Click **Save Results** to export the summary values to CSV, or **Save Curve & Plot** to export the count-curve data (CSV) plus the embedded plot (PNG).
+6. Click **Save Measurement Results** to export the summary values to CSV, or **Save Count Curve Data & Figures** to export the count-curve data (CSV) plus all count curve plots (PNG).
 
 ## How to use the widget
 
@@ -98,21 +98,27 @@ The plugin requires Python ≥ 3.10.
 
 The widget is laid out top to bottom:
 
-1. **Input** — pick the `Labels` layer that contains your binary segmentation. In *Internal spacing* mode, a second dropdown appears for selecting the container layer.
-2. **Analysis** — pick one of the three modes (see table above).
+1. **Input** — pick the `Labels` layer that contains your segmentation. Two extra controls decide *how* the labels are analysed:
+   - **Analyze** — `All combined` (the default: every selected label is merged into one binary volume and produces a single population-average curve, exactly as in the paper) or `Each object` (every selected label is analysed separately, giving one curve and one set of measurements per object).
+   - **Label IDs** — `all` (every non-zero label) or a comma-separated list such as `1,3,5`. In *Each object* mode the listed labels are analysed one at a time; in *All combined* mode they are merged. A plain binary mask (only label `1`) behaves identically either way.
+
+   In *Internal spacing* mode, a second dropdown appears for selecting the container layer.
+2. **Analysis** — pick one of the three modes (see table above). Per-object analysis works in all three.
 3. **Parameters** — basic parameters are always visible; click **▶ Advanced mode** to reveal Connectivity, Offset, and the "Rank peaks by smoothed value" checkbox.
 4. **Physical Scale** — enter your voxel size and physical unit if you want results in nm / µm in addition to voxels.
-5. **Run Analysis** — starts the computation on a background thread.
-6. **Plot** — the raw and smoothed count curve, with the detected peak marked (dashed vertical line) and the FWHM shown as a dashed horizontal bar.
-7. **Results** — the raw peak (radius / half-spacing), twice that (full width / inter-object spacing), and the full-width at half-maximum (FWHM) in voxels (and, if voxel size is set, in physical units too).
-8. **Save Results** and **Save Curve & Plot** — two separate export buttons. The first writes a small CSV with just the summary values from the Results section; the second writes the raw + smoothed count curve to CSV *and* saves the count curve plot as a PNG. See **Outputs** below.
+5. **Run Analysis** — starts the computation on a background thread. In per-object mode the single progress bar spans all objects.
+6. **Plot** — the raw and smoothed count curve, with the detected peak marked (dashed vertical line) and the FWHM shown as a dashed horizontal bar. In per-object mode a **Show object** selector appears above the plot: pick `Object <label>` to display that object's curve (and update the Results below), or choose one of the two overlay entries — **All (overlay – smoothed)** or **All (overlay – raw)** — to overlay every object's curve in one plot for comparison (offered for up to 10 objects). In the overlays, each object's curve is drawn in the **same colour napari assigns its label**, so you can match curves to objects at a glance. A **Highlight in viewer** checkbox (on by default) isolates the selected object in the source `Labels` layer using napari's native single-label view.
+7. **Results** — a caption naming the current object (`All combined`, or `Object <label>`), then the raw peak (radius / half-spacing), twice that (full width / inter-object spacing), and the full-width at half-maximum (FWHM) in voxels (and, if voxel size is set, in physical units too).
+8. **Save Measurement Results** and **Save Count Curve Data & Figures** — two separate export buttons. The first writes a small CSV with just the summary values from the Results section (one row per object); the second writes the raw + smoothed count curve to CSV *and* saves **every** count curve plot as PNG(s) — in per-object mode one per object plus both overlays (collected in a subfolder named after your chosen filename), not just the plot currently on screen. See **Outputs** below.
 
 ### Input parameters
 
 | Parameter | Where | Default | Description |
 |---|---|---|---|
-| **Segmentation layer** | Input | — | The `Labels` layer containing your binary segmentation (all non-zero voxels are treated as foreground). |
-| **Container layer** | Input (internal-spacing mode only) | — | A second `Labels` layer defining the parent compartment for *Internal spacing* mode. |
+| **Segmentation layer** | Input | — | The `Labels` layer containing your segmentation. In *All combined* mode all selected labels are treated as one binary foreground; in *Each object* mode each label is analysed separately. |
+| **Analyze** | Input | All combined | `All combined` merges the selected labels into a single binary volume and reports one population-average curve (the original behaviour, matching the paper). `Each object` analyses every selected label separately, producing one curve and one set of measurements per object. |
+| **Label IDs** | Input | all | Which labels take part. `all` (or an empty field) selects every non-zero label; a list like `1,3,5` (brackets and spaces are tolerated) selects specific ones. Combined with the **Analyze** toggle above: *Each object* + `1,3,5` analyses those three one at a time; *All combined* + `1,3,5` merges just those three. |
+| **Container layer** | Input (internal-spacing mode only) | — | A second `Labels` layer defining the parent compartment for *Internal spacing* mode. In per-object mode it is cropped to each object's bounding box automatically. |
 | **Mode** | Analysis | Object radius / half-thickness | One of the three analysis modes described above. |
 | **Lambda** | Parameters | 0.1 (minimum) | Subpixel step size in voxel-length units, in the range `0.1`–`1.0`. `0.1` means 10 morphology steps per voxel. Smaller values are more accurate but slower; the minimum is set to `0.1` because smaller steps quickly become impractical without offering further accuracy gains. |
 | **Max steps** | Parameters | 100 | Total number of morphology steps. Limits the maximum measurable distance to `max_steps × Lambda` voxels (e.g. 100 × 0.1 = 10 voxels). |
@@ -149,25 +155,31 @@ In every mode, values are shown in the chosen physical unit first with the voxel
 
 There are **two export buttons** below the Results section:
 
-**Save Results**: Prompts for a CSV path and writes only the summary values shown in the Results compartment:
+**Save Measurement Results**: Prompts for a CSV path and writes the summary values shown in the Results compartment, **one row per analysed object**:
 
 - A title line — `# napari-persistent-homology — Summary Results`.
-- A comment header — `# Mode: …`, `# Parameters: …`, and `# Voxel size: …` (or a note that it was not set).
-- A `Metric` / `Value_vox` (and `Value_<unit>` when a physical voxel size is set, e.g. `Value_nm` or `Value_um`) table whose row labels match the results in the widget:
-  - In erosion mode: `Radius / half-thickness`, `Width / thickness`, `Full-width at half-maximum`
-  - In dilation modes: `Half-spacing`, `Inter-object spacing`, `Full-width at half-maximum`
+- A comment header — `# Mode: …`, `# Parameters: …` (which now also records `analyze=combined|each` and the `label_ids`), and `# Voxel size: …` (or a note that it was not set).
+- A table led by a `Label_ID` column (`all` for a combined run, the label value for each per-object row), followed by three metric columns in voxels (and `_<unit>` variants when a physical voxel size is set, e.g. `_nm` / `_um`):
+  - In erosion mode: `Radius_half_thickness_vox`, `Width_thickness_vox`, `FWHM_vox`
+  - In dilation modes: `Half_spacing_vox`, `Inter_object_spacing_vox`, `FWHM_vox`
+  - Objects with no detected peak are written as `NaN`.
 
-**Save Curve & Plot**: Prompts for a single path and writes two siblings derived from it:
+**Save Count Curve Data & Figures**: Prompts for a single path and writes the count-curve CSV plus **all** count curve plots as PNGs:
 
-- `<base>.csv` — title line `# napari-persistent-homology — Object Count Curve` (erosion mode) or `# napari-persistent-homology — Hole Count Curve` (dilation modes), the same metadata header as the summary file, plus the full per-round count curve. Columns are `Erosion_round` or `Dilation_round`, followed by `Count_raw` and `Count_smoothed`.
-- `<base>.png` — the count curve plot generated with matplotlib as it appears in the widget, rendered at 150 DPI with a tight bounding box.
+- `<base>.csv` — title line `# napari-persistent-homology — Object Count Curve` (erosion mode) or `# napari-persistent-homology — Hole Count Curve` (dilation modes), the same metadata header as the summary file, plus the full per-round count curve in tidy/long form. Columns are `Label_ID`, `Erosion_round` or `Dilation_round`, `Count_raw`, and `Count_smoothed`, with one block of rows per object (`all` for a combined run). The CSV always sits directly in the directory you chose.
+- The plot PNGs (all rendered at 150 DPI with a tight bounding box):
+  - **Single-object analysis** (aggregate / binary case, or a per-object run with a single object): the one plot is saved directly next to the CSV as `<base>.png`.
+  - **Multi-object per-object analysis:** all plots go into a subfolder named exactly after your chosen filename (the CSV stem, no suffix appended). Inside, files are named by what the curve counts: `object_count_obj_<label>.png` (erosion) or `hole_count_obj_<label>.png` (dilation) for each object with a detected peak, plus `<prefix>_overlay_smoothed.png` and `<prefix>_overlay_raw.png` when the overlays are available (2–10 objects). Objects with no detected peak are skipped (they have no curve).
 
-If you pick e.g. the name `result.csv`, the PNG is saved alongside as `result.png`. Any `.csv` or `.png` extension you type is stripped first so the two files always share a base name.
+Each Save dialog **prefills a structured default name** — `<Mode>_<analyze>_<kind>.csv`, e.g. `Object_radius_per_object_measurements.csv` or `Object_spacing_combined_objects_count_curve_data.csv` — which you can accept or edit. `<Mode>` is `Object_radius` (erosion), `Object_spacing` (object-spacing dilation) or `Internal_spacing` (internal-spacing); `<analyze>` is `per_object` or `combined_objects`. If you pick e.g. `result.csv`, a single-object erosion run writes `result.csv` + `result.png`; a multi-object erosion run writes `result.csv` + a `result/` folder alongside it. **Existing files are never overwritten** — if the name already exists, it is auto-incremented (`result_2`, `result_3`, …), so saving several runs into the same directory keeps every one. Any `.csv` or `.png` extension you type is stripped first so the CSV and single-plot PNG share the base name.
 
 
 ### Sample data
 
-A small 3D cristae binary mask is bundled with the plugin and is available via **File → Open Sample → Cristae binary mask 3D (Persistent Homology 3D)**. It is a 114 × 163 × 234 `uint8` volume from a FIB-SEM acquisition and is a quick way to confirm that the plugin is working and to explore the '*Object radius / half-thickness (erosion)*' and '*Object spacing (dilation)*' modes.
+Two 3D FIB-SEM samples are bundled with the plugin, both under **File → Open Sample** (Persistent Homology 3D):
+
+- **Cristae binary mask 3D** — a 114 × 163 × 234 `uint8` binary volume. A quick way to confirm the plugin works and to explore the '*Object radius / half-thickness (erosion)*' and '*Object spacing (dilation)*' modes.
+- **Cristae multi-label mask 3D** — an image + labels pair (opens two layers) with 5 individually-labelled cristae (IDs 1–5). Ideal for trying **per-object analysis**: set **Analyze** to *Each object*, leave **Label IDs** on `all`, run, then step through the objects with the **Show object** selector.
 
 ## Citation
 

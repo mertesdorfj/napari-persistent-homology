@@ -2,10 +2,14 @@ import numpy as np
 import pytest
 
 from napari_persistent_homology._widget import (
+    _CURVE_LABEL,
+    _MAX_OVERLAY,
     _MODE_DILATION,
     _MODE_DILATION_INTERNAL,
     _MODE_EROSION,
+    _MODE_KEY,
     PersistentHomologyWidget,
+    parse_label_ids,
 )
 
 
@@ -61,27 +65,88 @@ def test_mode_change_hides_container(make_napari_viewer):
     assert widget._container_combo.isHidden()
 
 
-def _fake_completed_run(widget, mode_text=None):
-    """Helper: drive widget._on_result with a non-degenerate fake result
-    so the two save buttons are enabled and self._last_result is
-    populated as if a real analysis had completed."""
-    if mode_text is None:
-        mode_text = _MODE_EROSION
-    widget._run_params = {
+def _make_run_params(
+    mode_text=_MODE_EROSION,
+    *,
+    unit='vox',
+    vx=0.0,
+    vy=0.0,
+    vz=0.0,
+    analyze_each=False,
+    label_ids=(1,),
+    n_objects=1,
+    seg_name='seg',
+):
+    """Build a '_run_params' snapshot with all keys _on_run_clicked sets."""
+    return {
         'mode': mode_text,
+        'analyze_each': analyze_each,
+        'label_ids': list(label_ids),
+        'n_objects': n_objects,
+        'seg_name': seg_name,
         'Lambda': 0.1,
         'max_steps': 100,
         'connectivity': 26,
         'offset': 5,
         'rank_peaks_by_smoothed': False,
-        'unit': 'vox',
-        'vx': 0.0,
-        'vy': 0.0,
-        'vz': 0.0,
+        'unit': unit,
+        'vx': vx,
+        'vy': vy,
+        'vz': vz,
     }
-    series = np.zeros(101)
-    series[40:60] = 5.0
-    widget._on_result((series, 5.0, 2.0, 'Object count'))
+
+
+def _plateau_series(peak=5.0, length=101):
+    """A non-degenerate count curve: zeros with a plateau around the peak."""
+    series = np.zeros(length)
+    series[40:60] = peak
+    return series
+
+
+def _fake_worker_result(mode_text=_MODE_EROSION, *, objects=None):
+    """Build the dict the worker returns (one entry per analysed object)."""
+    mode_key = _MODE_KEY[mode_text]
+    if objects is None:
+        objects = [
+            {
+                'label_id': None,
+                'series': _plateau_series(),
+                'radius_vox': 5.0,
+                'fwhm_vox': 2.0,
+            }
+        ]
+    analyze_each = any(o['label_id'] is not None for o in objects)
+    return {
+        'analyze_each': analyze_each,
+        'mode_key': mode_key,
+        'curve_label': _CURVE_LABEL[mode_key],
+        'objects': objects,
+    }
+
+
+def _fake_completed_run(widget, mode_text=None, *, objects=None):
+    """Helper: drive widget._on_result with a non-degenerate fake result
+    so the two save buttons are enabled and self._results is populated as
+    if a real analysis had completed.
+
+    'objects' (a list of raw per-object dicts) drives per-object runs; the
+    default is a single aggregate object.
+    """
+    if mode_text is None:
+        mode_text = _MODE_EROSION
+    result = _fake_worker_result(mode_text, objects=objects)
+    widget._run_params = _make_run_params(
+        mode_text,
+        analyze_each=result['analyze_each'],
+        label_ids=[
+            o['label_id']
+            for o in result['objects']
+            if o['label_id'] is not None
+        ]
+        or (1,),
+        n_objects=len(result['objects']),
+    )
+    widget._on_result(result)
 
 
 def _read_csv_rows(path):
@@ -121,14 +186,18 @@ def test_save_results_writes_summary_csv_erosion(
 
     assert target.is_file()
     rows = _read_csv_rows(target)
-    # Column header — 'metric' (not 'stat')
-    assert rows[0] == ['Metric', 'Value_vox']
-    metric_labels = [r[0] for r in rows[1:]]
-    assert metric_labels == [
-        'Radius / half-thickness',
-        'Width / thickness',
-        'Full-width at half-maximum',
+    # Wide table: Label_ID + the three erosion metrics in voxels.
+    assert rows[0] == [
+        'Label_ID',
+        'Radius_half_thickness_vox',
+        'Width_thickness_vox',
+        'FWHM_vox',
     ]
+    # A single aggregate row, labelled 'all'.
+    assert len(rows) == 2
+    assert rows[1][0] == 'all'
+    # Width is exactly twice the radius.
+    assert float(rows[1][2]) == pytest.approx(2.0 * float(rows[1][1]))
     # The curve-x-axis columns must NOT appear in the summary
     assert not any(
         r[:1] in (['Erosion_round'], ['Dilation_round']) for r in rows
@@ -156,18 +225,17 @@ def test_save_results_writes_summary_csv_dilation(
     widget._on_save_clicked()
 
     rows = _read_csv_rows(target)
-    assert rows[0] == ['Metric', 'Value_vox']
-    metric_labels = [r[0] for r in rows[1:]]
-    assert metric_labels == [
-        'Half-spacing',
-        'Inter-object spacing',
-        'Full-width at half-maximum',
+    # Wide table: Label_ID + dilation metrics (half-spacing, inter-object, FWHM)
+    assert rows[0] == [
+        'Label_ID',
+        'Half_spacing_vox',
+        'Inter_object_spacing_vox',
+        'FWHM_vox',
     ]
+    assert len(rows) == 2
+    assert rows[1][0] == 'all'
     # Inter-object spacing must be exactly twice the half-spacing.
-    values = {r[0]: float(r[1]) for r in rows[1:]}
-    assert values['Inter-object spacing'] == pytest.approx(
-        2.0 * values['Half-spacing']
-    )
+    assert float(rows[1][2]) == pytest.approx(2.0 * float(rows[1][1]))
 
 
 def test_save_curve_writes_csv_and_png(
@@ -195,18 +263,18 @@ def test_save_curve_writes_csv_and_png(
     assert png_path.stat().st_size > 0
 
     rows = _read_csv_rows(csv_path)
-    # Erosion mode → the round column is named 'Erosion_round'
-    assert rows[0] == ['Erosion_round', 'Count_raw', 'Count_smoothed']
+    # Erosion mode → the round column is named 'Erosion_round'; the tidy
+    # table leads with a 'Label_ID' column ('all' in aggregate mode).
+    assert rows[0] == [
+        'Label_ID',
+        'Erosion_round',
+        'Count_raw',
+        'Count_smoothed',
+    ]
     assert len(rows) == 102  # 1 header + 101 data rows (rounds 0..100)
-    # The summary metric rows must NOT appear in the curve file
+    assert all(r[0] == 'all' for r in rows[1:])
+    # The summary metric column header must NOT appear in the curve file
     assert not any(r[:1] == ['Metric'] for r in rows)
-    metric_labels = {
-        'Radius / half-thickness',
-        'Width / thickness',
-        'Full-width at half-maximum',
-        'Inter-object spacing',
-    }
-    assert not any(r and r[0] in metric_labels for r in rows)
 
 
 def test_save_buttons_disabled_initially(make_napari_viewer):
@@ -293,12 +361,13 @@ def test_progress_bar_resets_on_run_started(make_napari_viewer):
     viewer = make_napari_viewer()
     widget = PersistentHomologyWidget(viewer)
 
-    # Simulate _on_started after a run_params snapshot
-    widget._run_params = {'max_steps': 50}
+    # Simulate _on_started after a run_params snapshot. The bar spans the
+    # whole run: n_objects * max_steps.
+    widget._run_params = {'max_steps': 50, 'n_objects': 3}
     widget._on_started()
 
     assert widget._progress_bar.value() == 0
-    assert widget._progress_bar.maximum() == 50
+    assert widget._progress_bar.maximum() == 150
     assert not widget._run_btn.isEnabled()
 
 
@@ -427,6 +496,27 @@ def test_run_with_same_layer_for_seg_and_container_shows_error(
     assert 'different layers' in text
 
 
+def test_run_with_mismatched_container_shape_shows_error(make_napari_viewer):
+    """Internal-spacing mode crops the container to each object's bounding box,
+    so a container whose shape differs from the segmentation must be rejected
+    up front with a clear message rather than failing deep in the worker."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    viewer.add_labels(np.ones((10, 10, 10), dtype=np.uint8), name='seg')
+    # A container of a different shape than the segmentation.
+    viewer.add_labels(np.ones((8, 10, 10), dtype=np.uint8), name='cont')
+
+    widget._mode_combo.setCurrentText(_MODE_DILATION_INTERNAL)
+    widget._seg_combo.setCurrentText('seg')
+    widget._container_combo.setCurrentText('cont')
+
+    widget._on_run_clicked()
+
+    text = widget._status_label.text()
+    assert 'Error' in text
+    assert 'does not match' in text
+
+
 def test_run_with_zero_voxel_size_in_physical_unit_shows_error(
     make_napari_viewer,
 ):
@@ -482,7 +572,7 @@ def test_reset_results_clears_labels_and_disables_save(make_napari_viewer):
     widget._fwhm_label.setText('3.00 vox')
     widget._save_btn.setEnabled(True)
     widget._save_curve_btn.setEnabled(True)
-    widget._last_result = ('placeholder',)
+    widget._results = ['placeholder']
 
     widget._reset_results()
 
@@ -491,7 +581,7 @@ def test_reset_results_clears_labels_and_disables_save(make_napari_viewer):
     assert widget._fwhm_label.text() == '—'
     assert widget._save_btn.isEnabled() is False
     assert widget._save_curve_btn.isEnabled() is False
-    assert widget._last_result is None
+    assert widget._results == []
 
 
 def test_run_click_clears_stale_results_before_validation(make_napari_viewer):
@@ -507,7 +597,7 @@ def test_run_click_clears_stale_results_before_validation(make_napari_viewer):
     widget._fwhm_label.setText('3.00 vox')
     widget._save_btn.setEnabled(True)
     widget._save_curve_btn.setEnabled(True)
-    widget._last_result = ('placeholder',)
+    widget._results = ['placeholder']
 
     # No Labels layer in the viewer → validation will fail on the first
     # check inside _on_run_clicked
@@ -520,7 +610,7 @@ def test_run_click_clears_stale_results_before_validation(make_napari_viewer):
     assert widget._fwhm_label.text() == '—'
     assert widget._save_btn.isEnabled() is False
     assert widget._save_curve_btn.isEnabled() is False
-    assert widget._last_result is None
+    assert widget._results == []
 
 
 def test_switching_to_physical_unit_sets_default_voxel_size(
@@ -573,23 +663,11 @@ def test_result_label_shows_physical_first_voxels_in_brackets(
     viewer = make_napari_viewer()
     widget = PersistentHomologyWidget(viewer)
 
-    widget._run_params = {
-        'mode': _MODE_EROSION,
-        'Lambda': 0.1,
-        'max_steps': 100,
-        'connectivity': 26,
-        'offset': 5,
-        'rank_peaks_by_smoothed': False,
-        'unit': 'nm',
-        'vx': 5.0,
-        'vy': 5.0,
-        'vz': 5.0,
-    }
+    widget._run_params = _make_run_params(
+        _MODE_EROSION, unit='nm', vx=5.0, vy=5.0, vz=5.0
+    )
     # Synthetic non-degenerate count curve so the result path runs
-    series = np.zeros(101)
-    series[40:60] = 5.0
-    fake_result = (series, 5.0, 2.0, 'Object count')
-    widget._on_result(fake_result)
+    widget._on_result(_fake_worker_result(_MODE_EROSION))
 
     # Physical value is reported first, voxel value in brackets
     # 5.0 vox × ((5+5+5)/3 = 5 nm/vox) = 25.00 nm
@@ -606,22 +684,8 @@ def test_result_label_voxel_only_when_unit_is_vox(make_napari_viewer):
     viewer = make_napari_viewer()
     widget = PersistentHomologyWidget(viewer)
 
-    widget._run_params = {
-        'mode': _MODE_EROSION,
-        'Lambda': 0.1,
-        'max_steps': 100,
-        'connectivity': 26,
-        'offset': 5,
-        'rank_peaks_by_smoothed': False,
-        'unit': 'vox',
-        'vx': 0.0,
-        'vy': 0.0,
-        'vz': 0.0,
-    }
-    series = np.zeros(101)
-    series[40:60] = 5.0
-    fake_result = (series, 5.0, 2.0, 'Object count')
-    widget._on_result(fake_result)
+    widget._run_params = _make_run_params(_MODE_EROSION, unit='vox')
+    widget._on_result(_fake_worker_result(_MODE_EROSION))
 
     assert widget._radius_label.text() == '5.00 vox'
     assert '(' not in widget._radius_label.text()
@@ -634,32 +698,14 @@ def test_completion_status_includes_analysis_mode(make_napari_viewer):
     viewer = make_napari_viewer()
     widget = PersistentHomologyWidget(viewer)
 
-    # A non-degenerate count curve: zeros with a 5.0 plateau around the
-    # peak step, so the degenerate-curve check passes and we reach the
-    # completion path.
-    series = np.zeros(101)
-    series[40:60] = 5.0
-    fake_result = (series, 5.0, 2.0, 'Object count')
-
     cases = [
         (_MODE_EROSION, 'Object radius / half-thickness'),
         (_MODE_DILATION, 'Object spacing'),
         (_MODE_DILATION_INTERNAL, 'Internal spacing'),
     ]
     for mode_text, expected_phrase in cases:
-        widget._run_params = {
-            'mode': mode_text,
-            'Lambda': 0.1,
-            'max_steps': 100,
-            'connectivity': 26,
-            'offset': 5,
-            'rank_peaks_by_smoothed': False,
-            'unit': 'vox',
-            'vx': 0.0,
-            'vy': 0.0,
-            'vz': 0.0,
-        }
-        widget._on_result(fake_result)
+        widget._run_params = _make_run_params(mode_text)
+        widget._on_result(_fake_worker_result(mode_text))
         text = widget._status_label.text()
         assert expected_phrase in text, (
             f'Status for {mode_text!r} should include {expected_phrase!r}, '
@@ -676,25 +722,20 @@ def test_degenerate_curve_shows_no_peak_error(make_napari_viewer):
     widget = PersistentHomologyWidget(viewer)
 
     # Set the run-params snapshot the way _on_run_clicked would have done.
-    widget._run_params = {
-        'mode': _MODE_EROSION,
-        'Lambda': 0.1,
-        'max_steps': 100,
-        'connectivity': 26,
-        'offset': 5,
-        'rank_peaks_by_smoothed': False,
-        'unit': 'vox',
-        'vx': 0.0,
-        'vy': 0.0,
-        'vz': 0.0,
-    }
+    widget._run_params = _make_run_params(_MODE_EROSION)
 
     # Simulate a degenerate worker output: all-zero count curve, with the
     # offset-fallback radius (0.5) and full-curve FWHM (10.0) that
     # find_max_location / compute_FWHM produce on a flat curve.
-    series = np.zeros(101)
-    fake_result = (series, 0.5, 10.0, 'Object count')
-    widget._on_result(fake_result)
+    degenerate = [
+        {
+            'label_id': None,
+            'series': np.zeros(101),
+            'radius_vox': 0.5,
+            'fwhm_vox': 10.0,
+        }
+    ]
+    widget._on_result(_fake_worker_result(_MODE_EROSION, objects=degenerate))
 
     text = widget._status_label.text()
     assert 'Error' in text
@@ -705,4 +746,538 @@ def test_degenerate_curve_shows_no_peak_error(make_napari_viewer):
     assert widget._fwhm_label.text() == '—'
     assert widget._save_btn.isEnabled() is False
     assert widget._save_curve_btn.isEnabled() is False
-    assert widget._last_result is None
+    assert widget._results == []
+
+
+# ---------------------------------------------------------------------------
+# parse_label_ids
+# ---------------------------------------------------------------------------
+
+
+class TestParseLabelIds:
+    def test_all_returns_every_available_sorted(self):
+        assert parse_label_ids('all', [3, 1, 2]) == [1, 2, 3]
+
+    def test_empty_string_means_all(self):
+        assert parse_label_ids('', [2, 1]) == [1, 2]
+
+    def test_case_insensitive_all(self):
+        assert parse_label_ids('ALL', [1, 2]) == [1, 2]
+
+    def test_comma_list(self):
+        assert parse_label_ids('1,3', [1, 2, 3]) == [1, 3]
+
+    def test_bracketed_list(self):
+        assert parse_label_ids('[1, 3]', [1, 2, 3]) == [1, 3]
+
+    def test_space_separated(self):
+        assert parse_label_ids('2 3', [1, 2, 3]) == [2, 3]
+
+    def test_dedup_and_sort(self):
+        assert parse_label_ids('3,1,3', [1, 2, 3]) == [1, 3]
+
+    def test_junk_raises(self):
+        with pytest.raises(ValueError, match='Could not parse'):
+            parse_label_ids('abc', [1, 2, 3])
+
+    def test_missing_label_raises(self):
+        with pytest.raises(ValueError, match='not present'):
+            parse_label_ids('1,9', [1, 2, 3])
+
+
+# ---------------------------------------------------------------------------
+# Per-object analysis
+# ---------------------------------------------------------------------------
+
+
+def _per_object_objects(n, peak=5.0):
+    """Build n per-object worker records (labels 1..n).
+
+    Each object's radius is '5.0 + i' vox, and its count-curve plateau is
+    centred on the matching peak step ('round(radius / 0.1)') so the object
+    is genuinely non-degenerate (the earlier objects at least — objects whose
+    peak step exceeds the 101-sample curve stay flat / degenerate, which the
+    large-N tests rely on).
+    """
+    objects = []
+    for i in range(n):
+        radius = 5.0 + i
+        step = int(round(radius / 0.1))  # peak step for this radius
+        series = np.zeros(101)
+        series[max(0, step - 10) : min(101, step + 10)] = peak + i
+        objects.append(
+            {
+                'label_id': i + 1,
+                'series': series,
+                'radius_vox': radius,
+                'fwhm_vox': 2.0,
+            }
+        )
+    return objects
+
+
+def test_per_object_run_populates_selector(make_napari_viewer):
+    """A per-object run of 3 objects fills the object selector with 3 entries
+    plus the two 'All (overlay)' entries, and shows the selector row."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget, objects=_per_object_objects(3))
+
+    # isHidden (not isVisible) is the reliable check in headless tests: the
+    # top-level widget is never shown, so isVisible() is always False.
+    assert not widget._object_row.isHidden()
+    # 3 objects + 2 overlay entries (smoothed + raw)
+    assert widget._object_selector.count() == 5
+    assert widget._object_selector.itemText(0) == 'Object 1'
+    assert widget._object_selector.itemData(3) == 'overlay_smoothed'
+    assert widget._object_selector.itemData(4) == 'overlay_raw'
+    # Results reflect the first object (label 1, radius 5.0)
+    assert widget._object_caption.text() == 'Object 1'
+    assert widget._radius_label.text() == '5.00 vox'
+    assert len(widget._results) == 3
+
+
+def test_aggregate_run_hides_selector(make_napari_viewer):
+    """Aggregate mode shows a single curve and hides the object selector."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget)  # default aggregate
+
+    assert widget._object_row.isHidden()
+    assert widget._object_caption.text() == 'All combined'
+
+
+def test_overlay_entry_omitted_above_max(make_napari_viewer):
+    """With more than _MAX_OVERLAY objects, the overlay entries are not
+    offered (the one-at-a-time selector still lists every object)."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    n = _MAX_OVERLAY + 1
+    _fake_completed_run(widget, objects=_per_object_objects(n))
+
+    assert widget._object_selector.count() == n  # no overlay entries
+    data = [
+        widget._object_selector.itemData(i)
+        for i in range(widget._object_selector.count())
+    ]
+    assert 'overlay_smoothed' not in data
+    assert 'overlay_raw' not in data
+
+
+def test_selecting_object_updates_results(make_napari_viewer):
+    """Switching the object selector updates the metric rows + caption."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget, objects=_per_object_objects(3))
+
+    # Select the 2nd object (index 1, label 2, radius 6.0)
+    widget._object_selector.setCurrentIndex(1)
+    assert widget._object_caption.text() == 'Object 2'
+    assert widget._radius_label.text() == '6.00 vox'
+
+    # Select the smoothed-overlay entry (index 3) → metrics blanked
+    widget._object_selector.setCurrentIndex(3)
+    assert widget._radius_label.text() == '—'
+    assert 'All objects' in widget._object_caption.text()
+
+    # Select the raw-overlay entry (index 4) → still an overlay view
+    widget._object_selector.setCurrentIndex(4)
+    assert widget._radius_label.text() == '—'
+    assert 'All objects' in widget._object_caption.text()
+
+
+def test_per_object_degenerate_object_kept(make_napari_viewer):
+    """A single degenerate object among several must not abort the run: it
+    is flagged 'no peak' in the selector while the others stay valid."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    objects = _per_object_objects(2)
+    objects.append(
+        {
+            'label_id': 3,
+            'series': np.zeros(101),
+            'radius_vox': 0.0,
+            'fwhm_vox': 0.0,
+        }
+    )
+    _fake_completed_run(widget, objects=objects)
+
+    assert len(widget._results) == 3
+    assert widget._results[2]['ok'] is False
+    # The degenerate object is labelled in the selector
+    assert 'no peak' in widget._object_selector.itemText(2)
+    # The valid first object is displayed
+    assert widget._radius_label.text() == '5.00 vox'
+
+
+def test_highlight_sets_selected_label(make_napari_viewer):
+    """With the highlight checkbox on, selecting a per-object entry sets the
+    napari Labels layer's selected_label + show_selected_label."""
+    viewer = make_napari_viewer()
+    # A real multi-label Labels layer for the highlight to target.
+    data = np.zeros((10, 10, 10), dtype=np.uint8)
+    data[1:4, 1:4, 1:4] = 1
+    data[6:9, 6:9, 6:9] = 2
+    layer = viewer.add_labels(data, name='seg')
+
+    widget = PersistentHomologyWidget(viewer)
+    widget._highlight_check.setChecked(True)
+    # run_params must name the real layer so the highlight can find it.
+    result = _fake_worker_result(_MODE_EROSION, objects=_per_object_objects(2))
+    widget._run_params = _make_run_params(
+        _MODE_EROSION,
+        analyze_each=True,
+        label_ids=[1, 2],
+        n_objects=2,
+        seg_name='seg',
+    )
+    widget._on_result(result)
+
+    # First object (label 1) selected → layer highlights label 1
+    assert layer.show_selected_label is True
+    assert layer.selected_label == 1
+
+    # Switch to object 2 → label 2
+    widget._object_selector.setCurrentIndex(1)
+    assert layer.selected_label == 2
+
+    # Turning the checkbox off clears the isolation
+    widget._highlight_check.setChecked(False)
+    assert layer.show_selected_label is False
+
+
+def test_object_colors_match_labels_layer(make_napari_viewer):
+    """Overlay curve colours are taken from the napari Labels layer, so each
+    object's curve matches its colour in the viewer."""
+    viewer = make_napari_viewer()
+    data = np.zeros((10, 10, 10), dtype=np.uint8)
+    data[1:4, 1:4, 1:4] = 1
+    data[6:9, 6:9, 6:9] = 2
+    layer = viewer.add_labels(data, name='seg')
+
+    widget = PersistentHomologyWidget(viewer)
+    widget._run_params = _make_run_params(
+        _MODE_EROSION,
+        analyze_each=True,
+        label_ids=[1, 2],
+        n_objects=2,
+        seg_name='seg',
+    )
+    widget._on_result(
+        _fake_worker_result(_MODE_EROSION, objects=_per_object_objects(2))
+    )
+
+    colors = widget._object_colors(widget._results)
+    assert len(colors) == 2
+    # Each colour equals the layer's true palette colour for that label.
+    # Read the expected colours with the highlight isolation off, since an
+    # active highlight makes get_color return transparent for non-selected
+    # labels (see test_object_colors_ignore_active_highlight).
+    layer.show_selected_label = False
+    for rec, color in zip(widget._results, colors, strict=True):
+        expected = tuple(float(c) for c in layer.get_color(rec['label_id']))
+        assert color == pytest.approx(expected)
+
+
+def test_object_colors_ignore_active_highlight(make_napari_viewer):
+    """Overlay colours must reflect the true per-label palette even when the
+    viewer highlight is active.
+
+    Regression: napari's 'show_selected_label' isolation makes 'get_color'
+    return a *transparent* colour for every non-selected label. Saving the
+    overlay while an individual object was highlighted therefore dropped every
+    other object's curve (it was drawn transparent). '_object_colors' must lift
+    the isolation for the read and restore it afterwards.
+    """
+    viewer = make_napari_viewer()
+    data = np.zeros((10, 10, 10), dtype=np.uint8)
+    data[1:4, 1:4, 1:4] = 1
+    data[6:9, 6:9, 6:9] = 2
+    layer = viewer.add_labels(data, name='seg')
+
+    widget = PersistentHomologyWidget(viewer)
+    widget._run_params = _make_run_params(
+        _MODE_EROSION,
+        analyze_each=True,
+        label_ids=[1, 2],
+        n_objects=2,
+        seg_name='seg',
+    )
+    widget._on_result(
+        _fake_worker_result(_MODE_EROSION, objects=_per_object_objects(2))
+    )
+
+    # Reproduce the save-time state: one object is highlighted in the viewer.
+    layer.selected_label = 1
+    layer.show_selected_label = True
+
+    colors = widget._object_colors(widget._results)
+    assert len(colors) == 2
+    # No colour may be fully transparent — every curve must be drawable.
+    for color in colors:
+        assert color[3] > 0.0
+    # The two objects get distinct colours (not both the highlighted one).
+    assert colors[0] != colors[1]
+    # The highlight state is restored after the read.
+    assert layer.show_selected_label is True
+
+
+def test_object_colors_fall_back_without_layer(make_napari_viewer):
+    """When the segmentation layer is gone, overlay colours fall back to the
+    matplotlib cycle rather than crashing."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    # seg_name points at a non-existent layer.
+    _fake_completed_run(widget, objects=_per_object_objects(2))
+    colors = widget._object_colors(widget._results)
+    assert len(colors) == 2
+    assert all(c is not None for c in colors)
+
+
+def test_per_object_save_results_one_row_per_object(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """Save Results in per-object mode writes one row per object, each keyed
+    by its Label_ID."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget, objects=_per_object_objects(3))
+
+    target = tmp_path / 'per_object.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_clicked()
+
+    rows = _read_csv_rows(target)
+    assert rows[0][0] == 'Label_ID'
+    # Three data rows, one per label
+    assert [r[0] for r in rows[1:]] == ['1', '2', '3']
+
+
+def test_per_object_save_curve_long_format(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """Save Curve in per-object mode writes a tidy/long table: every object's
+    curve rows carry that object's Label_ID."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget, objects=_per_object_objects(2))
+
+    target = tmp_path / 'curves.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_curve_clicked()
+
+    rows = _read_csv_rows(target)
+    assert rows[0] == [
+        'Label_ID',
+        'Erosion_round',
+        'Count_raw',
+        'Count_smoothed',
+    ]
+    label_ids = {r[0] for r in rows[1:]}
+    assert label_ids == {'1', '2'}
+    # 2 objects × 101 rounds + 1 header
+    assert len(rows) == 1 + 2 * 101
+
+
+def test_per_object_save_writes_all_plots_in_subfolder(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """Multi-object per-object runs collect one PNG per object plus both
+    overlay PNGs in a subfolder named exactly after the chosen CSV stem — not
+    just the currently-shown plot, and not loose in the chosen directory."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget, objects=_per_object_objects(3))
+
+    target = tmp_path / 'run.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_curve_clicked()
+
+    # Folder is the CSV stem itself; erosion → 'object_count' file prefix.
+    plot_dir = tmp_path / 'run'
+    assert plot_dir.is_dir()
+    # One PNG per object (labels 1, 2, 3) + both overlays, all in the subfolder.
+    for label in (1, 2, 3):
+        assert (plot_dir / f'object_count_obj_{label}.png').is_file()
+    assert (plot_dir / 'object_count_overlay_smoothed.png').is_file()
+    assert (plot_dir / 'object_count_overlay_raw.png').is_file()
+    # The CSV sits beside the folder, and no loose single-object PNG.
+    assert (tmp_path / 'run.csv').is_file()
+    assert not (tmp_path / 'run.png').is_file()
+
+
+def test_per_object_save_dilation_uses_hole_count_prefix(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """Dilation runs name the per-object PNGs 'hole_count_obj_<label>.png' (the
+    curve counts holes, not objects), inside the CSV-stem folder."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(
+        widget, mode_text=_MODE_DILATION, objects=_per_object_objects(2)
+    )
+
+    target = tmp_path / 'run.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_curve_clicked()
+
+    plot_dir = tmp_path / 'run'
+    assert plot_dir.is_dir()
+    assert (plot_dir / 'hole_count_obj_1.png').is_file()
+    assert (plot_dir / 'hole_count_obj_2.png').is_file()
+    assert (plot_dir / 'hole_count_overlay_smoothed.png').is_file()
+    assert (plot_dir / 'hole_count_overlay_raw.png').is_file()
+
+
+def test_single_object_save_writes_png_directly(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """Single-object analysis (aggregate / binary case) saves the one plot
+    directly next to the CSV — no subfolder."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget)  # aggregate = single object
+
+    target = tmp_path / 'run.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_curve_clicked()
+
+    assert (tmp_path / 'run.png').is_file()
+    # Single object → no plot subfolder is created.
+    assert not (tmp_path / 'run').exists()
+
+
+def test_per_object_save_skips_degenerate_object_png(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """A degenerate object has no curve, so no per-object PNG is written for
+    it (the overlays are still written, drawing it as a flat 'no peak' line)."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    objects = _per_object_objects(2)
+    objects.append(
+        {
+            'label_id': 3,
+            'series': np.zeros(101),
+            'radius_vox': 0.0,
+            'fwhm_vox': 0.0,
+        }
+    )
+    _fake_completed_run(widget, objects=objects)
+
+    target = tmp_path / 'run.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_curve_clicked()
+
+    plot_dir = tmp_path / 'run'
+    assert (plot_dir / 'object_count_obj_1.png').is_file()
+    assert (plot_dir / 'object_count_obj_2.png').is_file()
+    # degenerate object 3 → skipped
+    assert not (plot_dir / 'object_count_obj_3.png').is_file()
+    assert (plot_dir / 'object_count_overlay_smoothed.png').is_file()
+
+
+@pytest.mark.parametrize(
+    ('mode', 'analyze_each', 'kind', 'expected'),
+    [
+        (
+            _MODE_EROSION,
+            True,
+            'measurements',
+            'Object_radius_per_object_measurements.csv',
+        ),
+        (
+            _MODE_EROSION,
+            False,
+            'measurements',
+            'Object_radius_combined_objects_measurements.csv',
+        ),
+        (
+            _MODE_DILATION,
+            True,
+            'count_curve_data',
+            'Object_spacing_per_object_count_curve_data.csv',
+        ),
+        (
+            _MODE_DILATION_INTERNAL,
+            True,
+            'count_curve_data',
+            'Internal_spacing_per_object_count_curve_data.csv',
+        ),
+    ],
+)
+def test_default_save_name_encodes_mode_and_analyze(
+    make_napari_viewer, mode, analyze_each, kind, expected
+):
+    """The prefilled Save-dialog default name encodes the analysis mode and the
+    combined/per-object choice, so runs get distinctive names out of the box."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    widget._run_params = _make_run_params(mode, analyze_each=analyze_each)
+    assert widget._default_save_name(kind) == expected
+
+
+def test_save_measurements_dedup_increments_on_collision(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """Saving Measurement Results over an existing file does not overwrite it —
+    the name is auto-incremented to '_2'."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget)  # aggregate single object
+
+    existing = tmp_path / 'foo.csv'
+    existing.write_text('DO NOT OVERWRITE', encoding='utf-8')
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(existing), 'CSV files (*.csv)'),
+    )
+    widget._on_save_clicked()
+
+    # Original untouched; the new save landed on the '_2' name.
+    assert existing.read_text(encoding='utf-8') == 'DO NOT OVERWRITE'
+    assert (tmp_path / 'foo_2.csv').is_file()
+
+
+def test_save_curve_dedup_increments_on_folder_collision(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """A multi-object curve save whose plot folder name already exists bumps the
+    whole stem to '_2' (CSV + folder), leaving the earlier folder intact."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget, objects=_per_object_objects(2))
+
+    # An earlier run already produced the 'run' plot folder.
+    (tmp_path / 'run').mkdir()
+    target = tmp_path / 'run.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_curve_clicked()
+
+    # New outputs use the '_2' stem; the pre-existing folder is left empty.
+    assert (tmp_path / 'run_2.csv').is_file()
+    new_dir = tmp_path / 'run_2'
+    assert (new_dir / 'object_count_obj_1.png').is_file()
+    assert (new_dir / 'object_count_obj_2.png').is_file()
+    assert not any((tmp_path / 'run').iterdir())

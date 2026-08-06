@@ -29,8 +29,10 @@ Architecture
 """
 
 import csv
+import os
 from math import ceil
 
+import matplotlib as mpl
 import napari.layers
 import numpy as np
 from napari.qt.threading import thread_worker
@@ -47,6 +49,7 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -67,6 +70,7 @@ from matplotlib.figure import Figure
 
 from .ph_functions import (
     compute_homology_stats_v2,
+    label_subvolume,
     moving_average,
     persistent_homology_dilation,
     persistent_homology_dilation_internal_object,
@@ -90,6 +94,96 @@ _MODE_KEY = {
     _MODE_DILATION: 'dilation',
     _MODE_DILATION_INTERNAL: 'dilation_internal',
 }
+
+# Per-object analysis: the 'Analyze:' toggle values, and the maximum object
+# count for which the "All (overlay)" plot entry is offered (beyond this the
+# overlay is too cluttered to read, so only the one-at-a-time selector remains).
+_ANALYZE_COMBINED = 'All combined'
+_ANALYZE_EACH = 'Each object'
+_MAX_OVERLAY = 10
+
+# Curve label per mode (what the count curve measures). Object count for
+# erosion, hole count for the two dilation variants.
+_CURVE_LABEL = {
+    'erosion': 'Object count',
+    'dilation': 'Hole count',
+    'dilation_internal': 'Hole count (internal)',
+}
+
+# Mode + analyze tokens used to prefill a structured default filename in the
+# Save dialogs (e.g. 'Object_radius_per_object_measurements.csv'). The user can
+# freely edit the name; the chosen stem is then reused verbatim for the CSV, the
+# single-object PNG, and the multi-object plot subfolder — so nothing long is
+# appended on top and the structure lives in the (editable) default name.
+_MODE_NAME_TOKEN = {
+    'erosion': 'Object_radius',
+    'dilation': 'Object_spacing',
+    'dilation_internal': 'Internal_spacing',
+}
+_ANALYZE_NAME_TOKEN = {True: 'per_object', False: 'combined_objects'}
+
+# Filename prefix for each saved per-object PNG, naming what the curve counts:
+# object count for erosion, hole count for the two dilation variants (matches
+# '_CURVE_LABEL'). Used to build 'object_count_obj_3.png' / 'hole_count_obj_1.png'.
+_COUNT_FILE_PREFIX = {
+    'erosion': 'object_count',
+    'dilation': 'hole_count',
+    'dilation_internal': 'hole_count',
+}
+
+
+def parse_label_ids(text: str, available_ids) -> list[int]:
+    """Parse the 'Label IDs' text field into a list of label values.
+
+    Parameters
+    ----------
+    text: str
+        Raw text from the field. ``'all'`` (case-insensitive) or an empty
+        string selects every available label; otherwise a list of integers
+        written as ``'1,3,5'``, ``'[1, 3, 5]'`` or ``'1 3 5'``.
+    available_ids: sequence of int
+        The label values actually present in the segmentation (non-zero).
+
+    Returns
+    -------
+    list of int
+        Sorted, de-duplicated label IDs to analyse.
+
+    Raises
+    ------
+    ValueError
+        If the text cannot be parsed, or references a label that is not
+        present in the segmentation.
+    """
+    available = sorted(int(v) for v in available_ids)
+    stripped = text.strip().lower()
+    if stripped in ('', 'all'):
+        return available
+
+    tokens = (
+        stripped.replace('[', ' ').replace(']', ' ').replace(',', ' ').split()
+    )
+    try:
+        ids = [int(tok) for tok in tokens]
+    except ValueError:
+        raise ValueError(
+            f"Could not parse label IDs '{text}'. "
+            "Use 'all' or a list like 1,3,5."
+        ) from None
+    if not ids:
+        raise ValueError(
+            f"Could not parse label IDs '{text}'. "
+            "Use 'all' or a list like 1,3,5."
+        )
+
+    available_set = set(available)
+    missing = sorted({i for i in ids if i not in available_set})
+    if missing:
+        raise ValueError(
+            f'Label(s) {missing} not present in the segmentation. '
+            f'Available: {available}.'
+        )
+    return sorted(set(ids))
 
 
 ##############################################################################
@@ -127,11 +221,68 @@ class _ProgressEmitter(QObject):
 ##############################################################################
 
 
+def _make_step_callback(base, total_steps, step_callback):
+    """Return a per-object progress callback offset into the global range.
+
+    Each 'persistent_homology_*' function reports progress as
+    'step_callback(step + 1, max_steps)'. For a per-object run of N objects
+    we want one continuous bar over 'N * max_steps', so this wrapper shifts
+    each object's local step by 'base' (= object_index * max_steps) and
+    reports the shared total.
+    """
+
+    def cb(step, _local_total):
+        if step_callback is not None:
+            step_callback(base + step, total_steps)
+
+    return cb
+
+
+def _compute_series(
+    obj_mask, container_mask, mode_key, max_steps, Lambda, connectivity, cb
+):
+    """Run one persistent-homology analysis and return its count curve.
+
+    Picks the object-count curve for erosion and the hole-count curve for
+    the two dilation variants — the same choice the single-curve pipeline
+    made previously.
+    """
+    if mode_key == 'erosion':
+        obj_counts, _ = persistent_homology_erosion(
+            obj_mask,
+            max_steps=max_steps,
+            Lambda=Lambda,
+            Connectivity=connectivity,
+            step_callback=cb,
+        )
+        return obj_counts
+    if mode_key == 'dilation':
+        _, hole_counts = persistent_homology_dilation(
+            obj_mask,
+            max_steps=max_steps,
+            Lambda=Lambda,
+            Connectivity=connectivity,
+            step_callback=cb,
+        )
+        return hole_counts
+    _, hole_counts = persistent_homology_dilation_internal_object(
+        obj_mask,
+        container_mask,
+        max_steps=max_steps,
+        Lambda=Lambda,
+        Connectivity=connectivity,
+        step_callback=cb,
+    )
+    return hole_counts
+
+
 @thread_worker
 def _run_analysis(
-    volume: np.ndarray,
-    container_vol,
+    label_data: np.ndarray,
+    container_data,
     mode_key: str,
+    analyze_each: bool,
+    label_ids: list,
     Lambda: float,
     max_steps: int,
     connectivity: int,
@@ -142,20 +293,30 @@ def _run_analysis(
     """
     Run the selected persistent-homology analysis on a background thread.
 
-    Dispatches to one of the three analysis functions in 'ph_functions.py'
-    based on 'mode_key', picks the relevant count curve (object-count for
-    erosion, hole-count for the two dilation variants), and reduces it to
-    two scalar shape descriptors using 'compute_homology_stats_v2'.
+    Handles both the aggregate ('analyze_each=False' → one binarized volume,
+    one curve — the original behaviour) and the per-object mode
+    ('analyze_each=True' → one cropped binary sub-volume per label, one curve
+    each). For each job it dispatches to one of the three analysis functions
+    in 'ph_functions.py' based on 'mode_key', picks the relevant count curve
+    (object-count for erosion, hole-count for the two dilation variants), and
+    reduces it to two scalar shape descriptors using
+    'compute_homology_stats_v2'.
 
     Parameters
     ----------
-    volume: ndarray
-        Binary 3D segmentation to analyse.
-    container_vol: ndarray or None
-        Container mask, required when 'mode_key == "dilation_internal"',
+    label_data: ndarray
+        Raw (non-binarized) 3D label volume from the segmentation layer.
+    container_data: ndarray or None
+        Raw container mask, required when 'mode_key == "dilation_internal"',
         ignored otherwise.
     mode_key: str
         One of 'erosion', 'dilation', 'dilation_internal'.
+    analyze_each: bool
+        When True, analyse each label in 'label_ids' separately (one cropped
+        sub-volume per label); when False, binarize the union of 'label_ids'
+        into a single volume — the original aggregate behaviour.
+    label_ids: list of int
+        Label values to include.
     Lambda, max_steps, connectivity:
         Forwarded to the underlying persistent-homology function. See
         'ph_functions.persistent_homology_*' for details.
@@ -177,60 +338,100 @@ def _run_analysis(
 
     Returns
     -------
-    tuple
-        '(series, radius_vox, fwhm_vox, curve_label)' where 'series' is
-        the raw count curve, and 'radius_vox' / 'fwhm_vox' are the peak
-        location and full-width-at-half-maximum already converted to
-        voxel units by 'compute_homology_stats_v2'.
+    dict
+        '{"analyze_each", "mode_key", "curve_label", "objects"}' where
+        'objects' is a list of per-object dicts, each
+        '{"label_id", "series", "radius_vox", "fwhm_vox"}' with
+        'radius_vox' / 'fwhm_vox' already converted to voxel units by
+        'compute_homology_stats_v2'. 'label_id' is 'None' for the aggregate
+        (combined) job.
     """
     from napari.utils import progress
 
-    with progress(total=0):  # indeterminate spinner in napari activity bar
-        if mode_key == 'erosion':
-            obj_counts, hole_counts = persistent_homology_erosion(
-                volume,
-                max_steps=max_steps,
-                Lambda=Lambda,
-                Connectivity=connectivity,
-                step_callback=step_callback,
-            )
-            series = obj_counts
-            curve_label = 'Object count'
-        elif mode_key == 'dilation':
-            obj_counts, hole_counts = persistent_homology_dilation(
-                volume,
-                max_steps=max_steps,
-                Lambda=Lambda,
-                Connectivity=connectivity,
-                step_callback=step_callback,
-            )
-            series = hole_counts
-            curve_label = 'Hole count'
-        else:  # dilation_internal
-            obj_counts, hole_counts = (
-                persistent_homology_dilation_internal_object(
-                    volume,
-                    container_vol,
-                    max_steps=max_steps,
-                    Lambda=Lambda,
-                    Connectivity=connectivity,
-                    step_callback=step_callback,
-                )
-            )
-            series = hole_counts
-            curve_label = 'Hole count (internal)'
+    curve_label = _CURVE_LABEL[mode_key]
+    want_container = mode_key == 'dilation_internal'
 
-    # v2 returns (FWHM, max_location, max_count) already in voxel units
-    # (multiplied by Lambda), with internal noise-tolerant peak detection.
-    # 'rank_peaks_by_smoothed' picks between raw / smoothed weighting when
-    # choosing the tallest local peak — see 'find_max_location_v2'.
-    fwhm_vox, radius_vox, _max_count = compute_homology_stats_v2(
-        series,
-        offset=offset,
-        Lambda=Lambda,
-        rank_peaks_by_smoothed=rank_peaks_by_smoothed,
-    )
-    return series, float(radius_vox), float(fwhm_vox), curve_label
+    # Build the job list: (label_id, obj_mask, container_mask).
+    jobs = []
+    if analyze_each:
+        for lid in label_ids:
+            obj_mask, cont_mask, _ = label_subvolume(
+                label_data,
+                lid,
+                container_data if want_container else None,
+            )
+            jobs.append((int(lid), obj_mask, cont_mask))
+    else:
+        # Aggregate: whole binarized volume (no crop). For the default 'all'
+        # label set (and any plain binary mask) this is byte-for-byte identical
+        # to the pre-per-object 'data > 0' path; a combined *subset* of labels
+        # intentionally analyses only 'np.isin(label_data, label_ids)'.
+        obj_mask = np.isin(label_data, label_ids).astype(np.uint8)
+        cont_mask = (
+            (container_data > 0).astype(np.uint8) if want_container else None
+        )
+        jobs.append((None, obj_mask, cont_mask))
+
+    n_jobs = len(jobs)
+    total_steps = n_jobs * max_steps
+    objects = []
+
+    with progress(total=0):  # indeterminate spinner in napari activity bar
+        for j, (label_id, obj_mask, cont_mask) in enumerate(jobs):
+            base = j * max_steps
+
+            # Internal mode with an empty cropped container: hole counting is
+            # meaningless, so flag this object as "no peak" instead of
+            # crashing, and jump the progress bar past its slice.
+            if want_container and (cont_mask is None or cont_mask.sum() == 0):
+                objects.append(
+                    {
+                        'label_id': label_id,
+                        'series': np.zeros(max_steps + 1),
+                        'radius_vox': 0.0,
+                        'fwhm_vox': 0.0,
+                    }
+                )
+                if step_callback is not None:
+                    step_callback(base + max_steps, total_steps)
+                continue
+
+            cb = _make_step_callback(base, total_steps, step_callback)
+            series = _compute_series(
+                obj_mask,
+                cont_mask,
+                mode_key,
+                max_steps,
+                Lambda,
+                connectivity,
+                cb,
+            )
+            # v2 returns (FWHM, max_location, max_count) already in voxel
+            # units (multiplied by Lambda), with internal noise-tolerant peak
+            # detection. 'rank_peaks_by_smoothed' picks between raw / smoothed
+            # weighting when choosing the tallest local peak — see
+            # 'find_max_location_v2'.
+            fwhm_vox, radius_vox, _max_count = compute_homology_stats_v2(
+                series,
+                offset=offset,
+                Lambda=Lambda,
+                rank_peaks_by_smoothed=rank_peaks_by_smoothed,
+            )
+            objects.append(
+                {
+                    'label_id': label_id,
+                    'series': series,
+                    'radius_vox': float(radius_vox),
+                    'fwhm_vox': float(fwhm_vox),
+                }
+            )
+
+    return {
+        'analyze_each': analyze_each,
+        'mode_key': mode_key,
+        'curve_label': curve_label,
+        'objects': objects,
+    }
 
 
 ##############################################################################
@@ -273,9 +474,10 @@ class PersistentHomologyWidget(QWidget):
 
     Internal state
     --------------
-    - 'self._last_result': cached result tuple from the most recent run,
-      used by the "Save Results…" button. 'None' until the first run
-      completes successfully.
+    - 'self._results': list of per-object display records from the most
+      recent run (one entry in aggregate mode, N in per-object mode), used
+      by the object selector and both save buttons. Empty until the first
+      run completes successfully.
     - 'self._run_params': dict of parameter values captured at the start
       of the run; written into the CSV header by '_on_save_clicked'.
     - 'self._previous_unit': last selected unit string, used by
@@ -299,7 +501,13 @@ class PersistentHomologyWidget(QWidget):
         """
         super().__init__()
         self._viewer = viewer
-        self._last_result = None  # set after a successful run, enables Save
+        # Per-object display records from the last successful run (one entry
+        # in aggregate mode, N in per-object mode). Empty enables/disables the
+        # Save buttons and gates the object selector.
+        self._results: list = []
+        self._curve_label = (
+            ''  # what the count curve measures (mode-dependent)
+        )
         self._run_params: dict = {}
 
         # Floor the dock at the natural width of the longest row — the
@@ -368,6 +576,31 @@ class PersistentHomologyWidget(QWidget):
         input_form.addRow(self._container_label, self._container_combo)
         self._container_label.hide()
         self._container_combo.hide()
+
+        # Per-object selection: an 'Analyze:' toggle (combine every selected
+        # label into one volume, or analyse each label separately) plus a
+        # 'Label IDs' text field naming which labels take part. The default
+        # ('All combined' + 'all') reproduces the original single-curve
+        # behaviour, so a plain binary mask is unaffected.
+        self._analyze_combo = QComboBox()
+        self._analyze_combo.addItems([_ANALYZE_COMBINED, _ANALYZE_EACH])
+        input_form.addRow('Analyze:', self._analyze_combo)
+
+        self._label_ids_edit = QLineEdit('all')
+        self._label_ids_edit.setPlaceholderText('all   or   1,3,5')
+        input_form.addRow('Label IDs:', self._label_ids_edit)
+
+        label_ids_desc = QLabel(
+            "'all' = every label. In 'Each object' mode a comma-separated "
+            'list (e.g. 1,3,5) analyses those labels one at a time; in '
+            "'All combined' mode the listed labels are merged into a single "
+            'volume.'
+        )
+        label_ids_desc.setWordWrap(True)
+        label_ids_desc.setStyleSheet(
+            'color: gray; font-style: italic; padding-left: 12px;'
+        )
+        input_form.addRow(label_ids_desc)
 
         main_layout.addWidget(input_group)
 
@@ -623,6 +856,31 @@ class PersistentHomologyWidget(QWidget):
         main_layout.addWidget(self._status_label)
 
         # 6 ── Embedded matplotlib plot ─────────────────────────────────────
+        # Per-object selector row above the canvas: pick which object's curve
+        # to show (plus an "All (overlay)" entry for ≤ 10 objects), and a
+        # checkbox that highlights the picked object back in the viewer's
+        # Labels layer. The whole row is hidden in aggregate mode (one curve).
+        self._object_row = QWidget()
+        object_row_layout = QHBoxLayout()
+        object_row_layout.setContentsMargins(0, 0, 0, 0)
+        self._object_row.setLayout(object_row_layout)
+
+        object_row_layout.addWidget(QLabel('Show object:'))
+        self._object_selector = QComboBox()
+        self._object_selector.currentIndexChanged.connect(
+            self._on_object_selected
+        )
+        object_row_layout.addWidget(self._object_selector)
+
+        self._highlight_check = QCheckBox('Highlight in viewer')
+        self._highlight_check.setChecked(True)
+        self._highlight_check.toggled.connect(self._on_highlight_toggled)
+        object_row_layout.addWidget(self._highlight_check)
+        object_row_layout.addStretch()
+
+        self._object_row.setVisible(False)
+        main_layout.addWidget(self._object_row)
+
         self._figure = Figure(figsize=(4, 2.5), tight_layout=True)
         self._canvas = FigureCanvasQTAgg(self._figure)
         self._canvas.setMinimumHeight(200)
@@ -644,6 +902,13 @@ class PersistentHomologyWidget(QWidget):
         stats_group = QGroupBox('Results')
         stats_form = QFormLayout()
         stats_group.setLayout(stats_form)
+
+        # Caption naming which object the values below belong to
+        # ('All combined', 'Object k of N (label i)', or a hint in overlay
+        # mode). Empty until the first run.
+        self._object_caption = QLabel('')
+        self._object_caption.setStyleSheet('font-weight: bold;')
+        stats_form.addRow(self._object_caption)
 
         # Row labels are kept as instance attributes because their text
         # changes between modes: the first row is the raw peak (erosion
@@ -667,12 +932,12 @@ class PersistentHomologyWidget(QWidget):
         # raw + smoothed count curve as CSV and the embedded plot as PNG.
         save_row = QHBoxLayout()
 
-        self._save_btn = QPushButton('Save Results')
+        self._save_btn = QPushButton('Save Measurement Results')
         self._save_btn.setEnabled(False)
         self._save_btn.clicked.connect(self._on_save_clicked)
         save_row.addWidget(self._save_btn)
 
-        self._save_curve_btn = QPushButton('Save Curve && Plot')
+        self._save_curve_btn = QPushButton('Save Count Curve Data && Figures')
         self._save_curve_btn.setEnabled(False)
         self._save_curve_btn.clicked.connect(self._on_save_curve_clicked)
         save_row.addWidget(self._save_curve_btn)
@@ -787,21 +1052,33 @@ class PersistentHomologyWidget(QWidget):
         radius / width / FWHM numbers paired with a new error message.
 
         Resets:
-        - Radius / Width / FWHM value labels back to "—"
+        - Radius / Width / FWHM value labels back to "—" and the object caption
         - The row labels (and the width-row visibility) to match the
           *current* mode — this is the only place result-row labels are
           allowed to change, so switching modes without clicking Run
           leaves the previous result fully intact.
+        - The object selector (cleared + row hidden) and the viewer highlight
         - The matplotlib plot back to its grey placeholder
-        - The cached '_last_result' tuple to None
-        - The Save Results button to disabled
+        - The cached per-object results to an empty list
+        - The Save buttons to disabled
         """
+        # Restore the viewer's Labels layer before dropping the run params
+        # that name it.
+        self._clear_highlight()
+
+        self._object_caption.setText('')
         self._radius_label.setText('—')
         self._width_label.setText('—')
         self._fwhm_label.setText('—')
-        self._last_result = None
+        self._results = []
         self._save_btn.setEnabled(False)
         self._save_curve_btn.setEnabled(False)
+
+        # Clear + hide the object selector (no spurious callback while empty).
+        self._object_selector.blockSignals(True)
+        self._object_selector.clear()
+        self._object_selector.blockSignals(False)
+        self._object_row.setVisible(False)
 
         # Both rows are shown in every mode. The first row is always the raw
         # peak location (a half-quantity per the paper); the second row is
@@ -819,11 +1096,15 @@ class PersistentHomologyWidget(QWidget):
         self._width_row_label.setVisible(True)
         self._width_label.setVisible(True)
 
+        self._plot_message('Run analysis to see the count curve')
+
+    def _plot_message(self, text: str) -> None:
+        """Clear the plot axes and show a centred grey placeholder message."""
         self._ax.clear()
         self._ax.text(
             0.5,
             0.5,
-            'Run analysis to see the count curve',
+            text,
             ha='center',
             va='center',
             transform=self._ax.transAxes,
@@ -839,9 +1120,12 @@ class PersistentHomologyWidget(QWidget):
 
         Validation steps (in order):
         1. A segmentation layer must be selected.
-        2. In internal-spacing mode, a container layer must also be selected.
-        3. The segmentation must contain at least one non-zero voxel.
-        4. Very large volumes (> 500^3 voxels) display a warning but still
+        2. In internal-spacing mode, a container layer must also be selected
+           and must differ from the segmentation.
+        3. In nm / µm mode all three voxel sizes must be strictly positive.
+        4. The segmentation must contain at least one non-zero voxel, and the
+           'Label IDs' field must parse and reference labels that are present.
+        5. Very large volumes (> 500^3 voxels) display a warning but still
            proceed — the computation is long but legitimate.
 
         After validation, the current parameter values are snapshotted into
@@ -849,6 +1133,11 @@ class PersistentHomologyWidget(QWidget):
         '_ProgressEmitter' is created and connected, and a 'thread_worker'
         is started. The worker's 'returned' / 'errored' / 'started' /
         'finished' signals are connected to the corresponding '_on_*' slots.
+
+        The raw (non-binarized) label data is passed to the worker so it can
+        either binarize the union of the selected labels (aggregate mode) or
+        crop each label into its own sub-volume (per-object mode). Layer data
+        is read here on the GUI thread, as napari layer access must be.
         """
         # Always start from a clean slate so a failed Run click cannot leave
         # the user staring at stale radius / FWHM numbers from a previous
@@ -865,7 +1154,9 @@ class PersistentHomologyWidget(QWidget):
         mode_text = self._mode_combo.currentText()
         mode_key = _MODE_KEY[mode_text]
 
-        container_vol = None
+        # Raw container data (cropped / binarized later by the worker), only
+        # needed in internal-spacing mode.
+        container_data = None
         if mode_key == 'dilation_internal':
             container_name = self._container_combo.currentText()
             if not container_name:
@@ -880,9 +1171,7 @@ class PersistentHomologyWidget(QWidget):
                     error=True,
                 )
                 return
-            container_vol = (
-                self._viewer.layers[container_name].data > 0
-            ).astype(np.uint8)
+            container_data = self._viewer.layers[container_name].data
 
         # Physical-scale validation: in nm / µm mode all three voxel
         # dimensions must be strictly positive, otherwise the voxel →
@@ -903,18 +1192,50 @@ class PersistentHomologyWidget(QWidget):
                 )
                 return
 
-        volume = (self._viewer.layers[seg_name].data > 0).astype(np.uint8)
-
-        if volume.sum() == 0:
+        # Raw label data (not binarized — the worker needs the label values to
+        # extract per-object sub-volumes).
+        label_data = self._viewer.layers[seg_name].data
+        available = np.unique(label_data)
+        available = available[available != 0]
+        if available.size == 0:
             self._set_status(
                 'Error: Segmentation layer is empty (all zero voxels).',
                 error=True,
             )
             return
 
-        if volume.size > 500**3:
+        # Internal mode crops the container to each object's bounding box, which
+        # only makes sense if the two volumes are voxel-aligned. Catch a shape
+        # mismatch here with a clear message instead of letting it surface as a
+        # cryptic indexing/broadcast error deep inside the worker.
+        if (
+            container_data is not None
+            and container_data.shape != label_data.shape
+        ):
             self._set_status(
-                f'Warning: Volume has {volume.size:,} voxels — '
+                f'Error: Container shape {tuple(container_data.shape)} does '
+                f'not match segmentation shape {tuple(label_data.shape)}.',
+                error=True,
+            )
+            return
+
+        # Parse the 'Label IDs' field against the labels actually present.
+        analyze_each = self._analyze_combo.currentText() == _ANALYZE_EACH
+        try:
+            label_ids = parse_label_ids(
+                self._label_ids_edit.text(), available.tolist()
+            )
+        except ValueError as exc:
+            self._set_status(f'Error: {exc}', error=True)
+            return
+
+        # One job per label in per-object mode; a single combined job
+        # otherwise. Used to size the progress bar over N * max_steps.
+        n_objects = len(label_ids) if analyze_each else 1
+
+        if label_data.size > 500**3:
+            self._set_status(
+                f'Warning: Volume has {label_data.size:,} voxels — '
                 'computation may take a very long time.'
             )
 
@@ -927,6 +1248,10 @@ class PersistentHomologyWidget(QWidget):
 
         self._run_params = {
             'mode': mode_text,
+            'analyze_each': analyze_each,
+            'label_ids': label_ids,
+            'n_objects': n_objects,
+            'seg_name': seg_name,
             'Lambda': Lambda,
             'max_steps': max_steps,
             'connectivity': connectivity,
@@ -943,9 +1268,11 @@ class PersistentHomologyWidget(QWidget):
         self._progress_emitter.progress_changed.connect(self._on_progress)
 
         worker = _run_analysis(
-            volume,
-            container_vol,
+            label_data,
+            container_data,
             mode_key,
+            analyze_each,
+            label_ids,
             Lambda,
             max_steps,
             connectivity,
@@ -975,9 +1302,14 @@ class PersistentHomologyWidget(QWidget):
         self._status_label.setText(text)
 
     def _on_started(self) -> None:
-        """Disable the Run button and reset the progress bar to 0 / max_steps."""
+        """Disable the Run button and reset the progress bar.
+
+        The range spans the whole run: 'n_objects * max_steps' steps, so the
+        single bar fills smoothly across a per-object sweep of N objects.
+        """
         self._run_btn.setEnabled(False)
-        self._progress_bar.setRange(0, self._run_params['max_steps'])
+        total = self._run_params['n_objects'] * self._run_params['max_steps']
+        self._progress_bar.setRange(0, total)
         self._progress_bar.setValue(0)
         self._set_status('Computing…')
 
@@ -1009,27 +1341,49 @@ class PersistentHomologyWidget(QWidget):
             msg = msg[0].upper() + msg[1:]
         self._set_status(f'Error: {msg}', error=True)
 
-    def _on_result(self, result: tuple) -> None:
+    @staticmethod
+    def _mode_display(mode_key: str) -> dict:
+        """Return the mode-dependent display strings for a run.
+
+        The peak label names the raw-peak quantity (a half-quantity per the
+        paper):
+          erosion             → object-count curve, peak ≈ radius
+          dilation            → hole-count curve, peak ≈ half-spacing
+          dilation_internal   → hole-count curve, peak ≈ half-spacing
         """
-        Format the result, update the result labels, refresh the plot.
+        if mode_key == 'erosion':
+            return {
+                'analysis_name': 'Object radius / half-thickness',
+                'peak_label': 'Max / radius',
+                'x_axis_label': 'Erosion round',
+                'y_axis_label': 'Object count',
+            }
+        if mode_key == 'dilation':
+            return {
+                'analysis_name': 'Object spacing',
+                'peak_label': 'Max / half-spacing',
+                'x_axis_label': 'Dilation round',
+                'y_axis_label': 'Hole count',
+            }
+        return {
+            'analysis_name': 'Internal spacing',
+            'peak_label': 'Max / half-spacing',
+            'x_axis_label': 'Dilation round',
+            'y_axis_label': 'Hole count',
+        }
 
-        Converts the radius / FWHM voxel values to physical units via the
-        arithmetic mean of the X/Y/Z voxel pitches when a non-'vox' unit
-        is selected and all three voxel sizes are set. If the voxel size
-        is unset (still at the '—' placeholder, i.e. 0.0), the physical
-        value is shown as '—' as well. The smoothed curve, peak step
-        location, and the result tuple are cached on 'self._last_result'
-        for later use by 'Save Results…'.
+    def _process_object(self, obj: dict, p: dict) -> dict:
+        """Turn one raw worker result into a display record.
 
-        Degenerate input (count curve never rises above zero — typically
-        when the algorithm finds no measurable signal) is detected here
-        and reported as 'No peak detected — count curve is empty' rather
-        than displaying the meaningless '0' fallback that
-        'compute_homology_stats_v2' returns on such curves.
+        Adds the smoothed curve, the peak step index, an 'ok' flag (False for
+        degenerate curves), and the pre-formatted radius / width / FWHM
+        strings. Voxel → physical conversion uses the arithmetic mean of the
+        X/Y/Z voxel pitches when a non-'vox' unit is selected and all three
+        voxel sizes are set.
         """
-        series, radius_vox, fwhm_vox, curve_label = result
-
-        p = self._run_params
+        series = obj['series']
+        radius_vox = obj['radius_vox']
+        fwhm_vox = obj['fwhm_vox']
 
         # For plot rendering: the smoothed curve mirrors what v2 uses
         # internally when computing FWHM (moving average over one full
@@ -1042,29 +1396,24 @@ class PersistentHomologyWidget(QWidget):
 
         # Degenerate curve: v2 falls back to '0' on empty / flat curves.
         # Detect either that fallback or a peak step that lies outside a
-        # meaningful part of the curve, and report an explicit error
-        # instead of displaying misleading zeros.
-        if (
+        # meaningful part of the curve — such an object is flagged 'not ok'
+        # (shown as "—" / "no peak") instead of displaying misleading zeros.
+        ok = not (
             (radius_vox == 0.0 and fwhm_vox == 0.0)
             or max_location_step >= len(smoothed)
             or smoothed[max_location_step] == 0
-        ):
-            self._reset_results()
-            self._set_status(
-                'Error: No peak detected — count curve is empty.',
-                error=True,
-            )
-            return
-
-        unit = p['unit']
+        )
 
         # The second result row is always twice the raw peak. In erosion that
         # is the full diameter / thickness; in dilation it is the full
         # inter-object spacing (the peak itself is a half-distance — see the
         # paper's Fig. 3 caption and the Persistent Homology methods section).
         width_vox = 2.0 * radius_vox
+        unit = p['unit']
 
-        if unit != 'vox' and min(p['vx'], p['vy'], p['vz']) > 0:
+        if not ok:
+            radius_str = width_str = fwhm_str = '—'
+        elif unit != 'vox' and min(p['vx'], p['vy'], p['vz']) > 0:
             # Physical units are the primary display; the voxel value
             # appears in brackets afterwards. Arithmetic mean of voxel
             # dimensions — appropriate for length quantities. Assumes
@@ -1087,104 +1436,269 @@ class PersistentHomologyWidget(QWidget):
             width_str = f'{width_vox:.2f} vox'
             fwhm_str = f'{fwhm_vox:.2f} vox'
 
-        self._radius_label.setText(radius_str)
-        self._width_label.setText(width_str)
-        self._fwhm_label.setText(fwhm_str)
+        return {
+            'label_id': obj['label_id'],
+            'series': series,
+            'smoothed': smoothed,
+            'radius_vox': radius_vox,
+            'fwhm_vox': fwhm_vox,
+            'width_vox': width_vox,
+            'max_location_step': max_location_step,
+            'ok': ok,
+            'radius_str': radius_str,
+            'width_str': width_str,
+            'fwhm_str': fwhm_str,
+        }
 
-        # Mode-dependent labels — used both for the completion status
-        # message and for the plot's axis / peak annotations. The peak label
-        # names the raw-peak quantity (a half-quantity per the paper).
-        #   erosion             → object-count curve, peak ≈ radius
-        #   dilation            → hole-count curve, peak ≈ half-spacing
-        #   dilation_internal   → hole-count curve, peak ≈ half-spacing
-        mode_key = _MODE_KEY[p['mode']]
-        if mode_key == 'erosion':
-            analysis_name = 'Object radius / half-thickness'
-            peak_label = 'Max / radius'
-            x_axis_label = 'Erosion round'
-            y_axis_label = 'Object count'
-        elif mode_key == 'dilation':
-            analysis_name = 'Object spacing'
-            peak_label = 'Max / half-spacing'
-            x_axis_label = 'Dilation round'
-            y_axis_label = 'Hole count'
-        else:  # "dilation_internal"
-            analysis_name = 'Internal spacing'
-            peak_label = 'Max / half-spacing'
-            x_axis_label = 'Dilation round'
-            y_axis_label = 'Hole count'
+    def _on_result(self, result: dict) -> None:
+        """
+        Process the worker result, populate the object selector, show object 0.
 
-        self._set_status(f'{analysis_name} analysis completed.')
+        The worker returns one raw record per analysed object (one in
+        aggregate mode, N in per-object mode). Each is formatted via
+        '_process_object'. If *every* object is degenerate the whole run is
+        reported as 'No peak detected'; otherwise the object selector is
+        populated and the first object is displayed.
+        """
+        p = self._run_params
+        mode_key = result['mode_key']
+        self._curve_label = result['curve_label']
 
-        # 'scale', 'max_location_step', and 'smoothed' were already computed
-        # above for the degenerate-curve check; reuse them here.
-        self._last_result = (
-            series,
-            smoothed,
-            radius_vox,
-            fwhm_vox,
-            curve_label,
-            max_location_step,
-        )
+        records = [self._process_object(obj, p) for obj in result['objects']]
+        self._results = records
 
-        self._update_plot(
-            series,
-            smoothed,
-            curve_label,
-            max_location_step,
-            fwhm_vox,
-            radius_vox,
-            peak_label,
-            x_axis_label,
-            y_axis_label,
-        )
+        # All objects degenerate → nothing meaningful to show.
+        if not any(r['ok'] for r in records):
+            self._reset_results()
+            self._set_status(
+                'Error: No peak detected — count curve is empty.',
+                error=True,
+            )
+            return
+
+        disp = self._mode_display(mode_key)
+        self._set_status(f'{disp["analysis_name"]} analysis completed.')
+
+        self._populate_object_selector(records, p['analyze_each'])
+        if p['analyze_each']:
+            # setCurrentIndex fires _on_object_selected, which draws object 0.
+            self._object_selector.blockSignals(True)
+            self._object_selector.setCurrentIndex(0)
+            self._object_selector.blockSignals(False)
+            self._on_object_selected(0)
+        else:
+            self._show_combined(records[0])
+
         self._save_btn.setEnabled(True)
         self._save_curve_btn.setEnabled(True)
 
-    def _update_plot(
-        self,
-        series: np.ndarray,
-        smoothed: np.ndarray,
-        curve_label: str,
-        max_location_step: int,
-        fwhm_vox: float,
-        radius_vox: float,
-        peak_label: str,
-        x_axis_label: str,
-        y_axis_label: str,
+    def _populate_object_selector(
+        self, records: list, analyze_each: bool
     ) -> None:
-        """
-        Redraw the embedded matplotlib plot for the latest run.
+        """Fill the 'Show object' combo, or hide the row in aggregate mode.
 
-        Shows the raw count curve (light) and its Gaussian-smoothed version
-        (dark), a dashed vertical line at the detected peak (labelled as
-        radius or spacing depending on mode), and a dashed horizontal bar
-        at half-peak height spanning the FWHM. The x-axis is the
-        morphology-step index, not voxels.
+        Each object entry ('Object <label>') carries its index as user-data;
+        two overlay entries ('overlay_smoothed' / 'overlay_raw') are added
+        only for 2..'_MAX_OVERLAY' objects — beyond that the overlay is too
+        cluttered to read.
         """
-        self._ax.clear()
+        combo = self._object_selector
+        combo.blockSignals(True)
+        combo.clear()
+        if analyze_each:
+            for i, rec in enumerate(records):
+                suffix = '' if rec['ok'] else '  — no peak'
+                combo.addItem(f'Object {rec["label_id"]}{suffix}', i)
+            if 1 < len(records) <= _MAX_OVERLAY:
+                combo.addItem('All (overlay – smoothed)', 'overlay_smoothed')
+                combo.addItem('All (overlay – raw)', 'overlay_raw')
+            self._object_row.setVisible(True)
+        else:
+            self._object_row.setVisible(False)
+        combo.blockSignals(False)
+
+    def _on_object_selected(self, index: int) -> None:
+        """Show the selected object's curve + metrics, or the overlay.
+
+        Slot for the 'Show object' combo. Reads the current entry's user-data
+        rather than the raw 'index' argument so the 'All (overlay)' entry is
+        recognised regardless of its position.
+        """
+        if not self._results:
+            return
+        data = self._object_selector.currentData()
+        if data in ('overlay_smoothed', 'overlay_raw'):
+            self._clear_highlight()
+            self._object_caption.setText(
+                'All objects — select one for metrics'
+            )
+            self._radius_label.setText('—')
+            self._width_label.setText('—')
+            self._fwhm_label.setText('—')
+            self._update_plot_overlay(
+                self._results,
+                kind='raw' if data == 'overlay_raw' else 'smoothed',
+            )
+            return
+
+        rec = self._results[int(data)]
+        self._object_caption.setText(f'Object {rec["label_id"]}')
+        self._show_object_record(rec)
+        self._apply_highlight(rec['label_id'])
+
+    def _show_combined(self, rec: dict) -> None:
+        """Display the single aggregate ('All combined') result record."""
+        self._object_caption.setText('All combined')
+        self._show_object_record(rec)
+        self._clear_highlight()  # nothing single to highlight in aggregate mode
+
+    def _show_object_record(self, rec: dict) -> None:
+        """Update the three metric rows + plot for one object record."""
+        self._radius_label.setText(rec['radius_str'])
+        self._width_label.setText(rec['width_str'])
+        self._fwhm_label.setText(rec['fwhm_str'])
+        if not rec['ok']:
+            self._plot_message('No peak detected for this object.')
+            return
+        self._update_plot(rec)
+
+    # ── Viewer highlight ────────────────────────────────────────────────────
+
+    def _seg_layer(self):
+        """Return the run's segmentation Labels layer, or None if unavailable.
+
+        The layer may have been renamed or removed since the run started, so
+        every highlight operation goes through this guarded lookup.
+        """
+        seg_name = self._run_params.get('seg_name')
+        if not seg_name or seg_name not in self._viewer.layers:
+            return None
+        layer = self._viewer.layers[seg_name]
+        if not isinstance(layer, napari.layers.Labels):
+            return None
+        return layer
+
+    def _apply_highlight(self, label_id) -> None:
+        """Highlight one label in the viewer via napari's native mechanism.
+
+        Sets 'selected_label' + 'show_selected_label' on the segmentation
+        Labels layer so only the picked object is shown — the same
+        regionprops-style isolation napari offers natively. No-op when the
+        highlight checkbox is off, the label is the aggregate 'None', or the
+        layer is gone.
+        """
+        layer = self._seg_layer()
+        if layer is None:
+            return
+        if not self._highlight_check.isChecked() or label_id is None:
+            layer.show_selected_label = False
+            return
+        layer.selected_label = int(label_id)
+        layer.show_selected_label = True
+
+    def _clear_highlight(self) -> None:
+        """Restore the full Labels view (turn off single-label isolation)."""
+        layer = self._seg_layer()
+        if layer is not None:
+            layer.show_selected_label = False
+
+    def _on_highlight_toggled(self, checked: bool) -> None:
+        """Re-apply or clear the highlight when the checkbox is toggled."""
+        if not checked:
+            self._clear_highlight()
+            return
+        # Re-apply for the currently-selected single object, if any.
+        # isHidden (not isVisible) so this works before the dock is shown.
+        if self._results and not self._object_row.isHidden():
+            data = self._object_selector.currentData()
+            if data is not None and data not in (
+                'overlay_smoothed',
+                'overlay_raw',
+            ):
+                rec = self._results[int(data)]
+                self._apply_highlight(rec['label_id'])
+
+    def _object_colors(self, records: list) -> list:
+        """Return one plot colour per object, matched to the Labels layer.
+
+        Uses the colour napari assigns each label ('layer.get_color') so the
+        overlay curves match the segmentation Labels layer (and the
+        single-label highlight). Falls back to the default matplotlib colour
+        cycle when the layer is gone or a colour can't be read.
+
+        The viewer highlight ('show_selected_label') isolates one label by
+        making 'get_color' return a *transparent* colour for every other
+        label. When that isolation is active (e.g. an individual object was
+        selected before the user clicked Save), reading colours here would
+        come back transparent for all but the highlighted object, so the
+        saved overlay dropped every other curve. We therefore lift the
+        isolation for the duration of the batch read and restore it after,
+        so the colours always reflect the true per-label palette regardless
+        of the current highlight state. (The on-screen overlay already clears
+        the highlight before drawing, so this toggle is a no-op there.)
+        """
+        layer = self._seg_layer()
+        fallback = mpl.rcParams['axes.prop_cycle'].by_key()['color']
+        restore_highlight = layer is not None and getattr(
+            layer, 'show_selected_label', False
+        )
+        if restore_highlight:
+            layer.show_selected_label = False
+        try:
+            colors = []
+            for i, rec in enumerate(records):
+                color = fallback[i % len(fallback)]
+                lid = rec['label_id']
+                if layer is not None and lid is not None:
+                    try:
+                        rgba = layer.get_color(int(lid))
+                    except Exception:  # noqa: BLE001 - defensive: 3rd-party API
+                        rgba = None
+                    if rgba is not None:
+                        color = tuple(float(c) for c in rgba)
+                colors.append(color)
+        finally:
+            if restore_highlight:
+                layer.show_selected_label = True
+        return colors
+
+    def _draw_single_on_ax(self, ax, rec: dict, disp: dict) -> None:
+        """Draw one object's raw + smoothed curve, peak line and FWHM bar on 'ax'.
+
+        Shared by the on-screen plot ('_update_plot') and the save-all-plots
+        renderer, so a saved PNG matches exactly what the widget shows. The
+        x-axis is the morphology-step index, not voxels.
+
+        Shows the raw count curve (light) and its moving-average-smoothed
+        version (dark), a dashed vertical line at the detected peak (labelled
+        as radius or spacing depending on mode), and a dashed horizontal bar
+        at half-peak height spanning the FWHM.
+        """
+        series = rec['series']
+        smoothed = rec['smoothed']
+        max_location_step = rec['max_location_step']
         x = list(range(len(series)))
-        self._ax.plot(
+        ax.plot(
             x,
             series,
             color='lightsteelblue',
             linewidth=1.0,
             alpha=0.85,
-            label=f'{curve_label} (raw data)',
+            label=f'{self._curve_label} (raw data)',
         )
-        self._ax.plot(
+        ax.plot(
             x,
             smoothed,
             color='steelblue',
             linewidth=1.5,
-            label=f'{curve_label} (smoothed)',
+            label=f'{self._curve_label} (smoothed)',
         )
-        self._ax.axvline(
+        ax.axvline(
             max_location_step,
             color='crimson',
             linestyle='--',
             linewidth=1.0,
-            label=f'{peak_label} = {radius_vox:.2f} vox',
+            label=f'{disp["peak_label"]} = {rec["radius_vox"]:.2f} vox',
         )
 
         # FWHM bar: dashed horizontal line at half-peak height, spanning
@@ -1200,23 +1714,183 @@ class PersistentHomologyWidget(QWidget):
         right = max_location_step
         while right < len(smoothed) - 1 and above[right + 1]:
             right += 1
-        self._ax.hlines(
+        ax.hlines(
             half_max,
             xmin=left,
             xmax=right,
             color='darkorange',
             linestyle='--',
             linewidth=1.5,
-            label=f'FWHM = {fwhm_vox:.2f} vox',
+            label=f'FWHM = {rec["fwhm_vox"]:.2f} vox',
         )
 
-        self._ax.set_xlabel(x_axis_label, fontsize=8)
-        self._ax.set_ylabel(y_axis_label, fontsize=8)
-        self._ax.tick_params(labelsize=7)
-        self._ax.legend(fontsize=7)
-        self._ax.set_axis_on()
+        ax.set_xlabel(disp['x_axis_label'], fontsize=8)
+        ax.set_ylabel(disp['y_axis_label'], fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=7)
+        ax.set_axis_on()
+
+    def _draw_overlay_on_ax(
+        self, ax, records: list, kind: str, disp: dict
+    ) -> None:
+        """Draw the per-object overlay ('smoothed' or 'raw') on 'ax'.
+
+        Each object is drawn in the colour napari assigns its label (see
+        '_object_colors'), with a faint dashed peak marker in the same colour;
+        degenerate objects are labelled '(no peak)' and drawn without a marker.
+        """
+        colors = self._object_colors(records)
+        key = 'series' if kind == 'raw' else 'smoothed'
+        for rec, color in zip(records, colors, strict=True):
+            suffix = '' if rec['ok'] else ' (no peak)'
+            ax.plot(
+                range(len(rec[key])),
+                rec[key],
+                color=color,
+                linewidth=1.3,
+                label=f'Object {rec["label_id"]}{suffix}',
+            )
+            if rec['ok']:
+                ax.axvline(
+                    rec['max_location_step'],
+                    color=color,
+                    linestyle='--',
+                    linewidth=0.8,
+                    alpha=0.6,
+                )
+        ax.set_xlabel(disp['x_axis_label'], fontsize=8)
+        ax.set_ylabel(f'{disp["y_axis_label"]} ({kind})', fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=7)
+        ax.set_axis_on()
+
+    def _update_plot(self, rec: dict) -> None:
+        """Redraw the embedded on-screen plot for one object record."""
+        disp = self._mode_display(_MODE_KEY[self._run_params['mode']])
+        self._ax.clear()
+        self._draw_single_on_ax(self._ax, rec, disp)
         self._figure.tight_layout()
         self._canvas.draw()
+
+    def _update_plot_overlay(
+        self, records: list, kind: str = 'smoothed'
+    ) -> None:
+        """Redraw the embedded on-screen plot as a per-object overlay.
+
+        'kind' selects the smoothed ('smoothed') or raw ('raw') curve — the
+        selector offers a separate overlay entry for each. Only reached for
+        2..'_MAX_OVERLAY' objects.
+        """
+        disp = self._mode_display(_MODE_KEY[self._run_params['mode']])
+        self._ax.clear()
+        self._draw_overlay_on_ax(self._ax, records, kind, disp)
+        self._figure.tight_layout()
+        self._canvas.draw()
+
+    def _save_all_plots(self, base: str) -> list:
+        """Render and save every count-curve plot as PNG(s).
+
+        Single-object runs (aggregate mode, or a per-object run with one
+        object) save one PNG directly next to the CSV ('<base>.png').
+        Multi-object per-object runs collect all their PNGs in a subfolder
+        named exactly after the CSV stem ('<base>/'), i.e. whatever the user
+        typed (or accepted from the structured default) in the save dialog —
+        nothing extra is appended, so the folder name stays as short as the
+        chosen filename. Inside, files are named by what the curve counts:
+        'object_count_obj_<label>.png' (erosion) or 'hole_count_obj_<label>.png'
+        (dilation) per non-degenerate object, plus
+        '<prefix>_overlay_smoothed.png' / '<prefix>_overlay_raw.png' when
+        N <= _MAX_OVERLAY. Each plot is rendered on a throwaway Figure so the
+        on-screen canvas is left untouched. Returns the list of written paths.
+        """
+        mode_key = _MODE_KEY[self._run_params['mode']]
+        disp = self._mode_display(mode_key)
+        prefix = _COUNT_FILE_PREFIX[mode_key]
+        saved: list = []
+
+        def _render_and_save(path: str, draw) -> None:
+            fig = Figure(figsize=(4, 2.5), tight_layout=True)
+            ax = fig.add_subplot(111)
+            draw(ax)
+            fig.savefig(path, dpi=150, bbox_inches='tight')
+            saved.append(path)
+
+        # Single object → one PNG directly in the chosen directory.
+        if len(self._results) <= 1:
+            rec = self._results[0]
+            if rec['ok']:
+                _render_and_save(
+                    f'{base}.png',
+                    lambda ax: self._draw_single_on_ax(ax, rec, disp),
+                )
+            return saved
+
+        # Multiple objects → a subfolder named exactly like the CSV stem (the
+        # deduplicated base), so it never overwrites an earlier run's folder.
+        plot_dir = base
+        os.makedirs(plot_dir, exist_ok=True)
+        for rec in self._results:
+            if not rec['ok']:
+                continue  # no curve to draw for a degenerate object
+            _render_and_save(
+                os.path.join(plot_dir, f'{prefix}_obj_{rec["label_id"]}.png'),
+                lambda ax, rec=rec: self._draw_single_on_ax(ax, rec, disp),
+            )
+        if len(self._results) <= _MAX_OVERLAY:
+            for kind in ('smoothed', 'raw'):
+                _render_and_save(
+                    os.path.join(plot_dir, f'{prefix}_overlay_{kind}.png'),
+                    lambda ax, kind=kind: self._draw_overlay_on_ax(
+                        ax, self._results, kind, disp
+                    ),
+                )
+        return saved
+
+    def _default_save_name(self, kind: str) -> str:
+        """Build a structured default filename to prefill a Save dialog.
+
+        'kind' is the trailing token — 'measurements' or 'count_curve_data'.
+        The name encodes the analysis mode and the combined/per-object choice
+        so runs get distinctive names out of the box, e.g.
+        'Object_radius_per_object_measurements.csv' or
+        'Object_spacing_combined_objects_count_curve_data.csv'. The user may
+        edit it freely; the chosen stem is reused verbatim for the CSV, the
+        single-object PNG and the multi-object plot subfolder.
+        """
+        p = self._run_params
+        mode_token = _MODE_NAME_TOKEN[_MODE_KEY[p['mode']]]
+        analyze_token = _ANALYZE_NAME_TOKEN[p['analyze_each']]
+        return f'{mode_token}_{analyze_token}_{kind}.csv'
+
+    @staticmethod
+    def _strip_save_ext(path: str) -> str:
+        """Strip a trailing '.csv' or '.png' (case-insensitive) from a chosen
+        save path, returning the bare stem.
+
+        Both save handlers share this so the CSV, the single-object PNG and the
+        plot folder always derive from one stem regardless of which of the two
+        extensions the user happened to type.
+        """
+        for ext in ('.csv', '.png'):
+            if path.lower().endswith(ext):
+                return path[: -len(ext)]
+        return path
+
+    @staticmethod
+    def _dedup_base(base: str, suffixes) -> str:
+        """Return 'base' (or 'base_2', 'base_3', …) for which every
+        'base + suffix' is free on disk, so a save never clobbers an earlier one.
+
+        'suffixes' lists what this save will create for the stem: e.g.
+        ['.csv', '.png'] for a single-object curve save, or ['.csv', ''] for a
+        multi-object save (the empty suffix is the plot folder itself).
+        """
+        candidate = base
+        n = 2
+        while any(os.path.exists(candidate + s) for s in suffixes):
+            candidate = f'{base}_{n}'
+            n += 1
+        return candidate
 
     def _write_metadata_header(
         self, w, p, *, note_voxel_size_when_unset: bool = True
@@ -1241,7 +1915,9 @@ class PersistentHomologyWidget(QWidget):
                 f'max_steps={p["max_steps"]}, '
                 f'connectivity={p["connectivity"]}, '
                 f'offset={p["offset"]}, '
-                f'rank_peaks_by_smoothed={p["rank_peaks_by_smoothed"]}'
+                f'rank_peaks_by_smoothed={p["rank_peaks_by_smoothed"]}, '
+                f'analyze={"each" if p["analyze_each"] else "combined"}, '
+                f'label_ids={p["label_ids"]}'
             ]
         )
         if unit != 'vox' and min(p['vx'], p['vy'], p['vz']) > 0:
@@ -1256,54 +1932,56 @@ class PersistentHomologyWidget(QWidget):
             w.writerow(['# Voxel size: not set (results in voxels only)'])
         return False
 
-    def _on_save_clicked(self) -> None:
-        """Save only the summary results — i.e. exactly what appears in
-        the Results section of the widget (radius, width, FWHM).
+    @staticmethod
+    def _metric_bases(mode_key: str) -> list:
+        """Column-name bases for the three summary metrics, per mode.
 
-        File contents:
-        - Comment header: mode, parameters, voxel-size info.
-        - Stats table: 'radius', 'width', 'fwhm' with their values in
-          voxels and (if a physical voxel size is set) in the chosen
-          physical unit.
-
-        A '.csv' extension is appended automatically if the user does
-        not supply one. Does nothing if no successful run has been
-        performed yet ('self._last_result is None').
+        Mirror the GUI row labels but drop the '(erosion)' qualifier (the
+        mode is already on the '# Mode:' header line) and use CSV-friendly
+        underscores. Both modes report the raw peak (a half-quantity) and
+        twice that (the full geometric size), matching the two GUI rows.
         """
-        if self._last_result is None:
+        if mode_key == 'erosion':
+            return ['Radius_half_thickness', 'Width_thickness', 'FWHM']
+        return ['Half_spacing', 'Inter_object_spacing', 'FWHM']
+
+    def _on_save_clicked(self) -> None:
+        """Save the summary results — exactly what the Results section shows.
+
+        Writes one row per analysed object (a single 'all' row in aggregate
+        mode, N rows in per-object mode). File contents:
+        - Comment header: mode, parameters (incl. analyze mode + label IDs),
+          voxel-size info.
+        - Stats table: 'Label_ID' plus the three mode-appropriate metrics in
+          voxels and (if a physical voxel size is set) in the chosen physical
+          unit. Objects with no detected peak are written as 'NaN'.
+
+        The dialog is prefilled with a structured default name
+        ('<Mode>_<analyze>_measurements.csv' — see '_default_save_name'); the
+        user can edit it. A '.csv' extension is appended automatically if the
+        user does not supply one, and if that file already exists the name is
+        auto-incremented ('_2', '_3', …) rather than overwritten. Does nothing
+        if no successful run has been performed yet ('self._results' empty).
+        """
+        if not self._results:
             return
 
         path, _ = QFileDialog.getSaveFileName(
-            self, 'Save Results', '', 'CSV files (*.csv)'
+            self,
+            'Save Measurement Results',
+            self._default_save_name('measurements'),
+            'CSV files (*.csv)',
+            options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if not path:
             return
-        if not path.lower().endswith('.csv'):
-            path += '.csv'
+        base = self._strip_save_ext(path)
+        # Never overwrite an existing summary CSV — bump to '_2', '_3', ….
+        path = self._dedup_base(base, ['.csv']) + '.csv'
 
-        _, _, radius_vox, fwhm_vox, _, _ = self._last_result
         p = self._run_params
         unit = p['unit']
-        width_vox = 2.0 * radius_vox
-
-        # Metric labels mirror the GUI row labels but drop the trailing
-        # '(erosion)' qualifier — the mode is already on the '# Mode:'
-        # line in the header, so repeating it here would be redundant.
-        # Both modes report the raw peak (a half-quantity) and twice that
-        # (the full geometric size), matching the two GUI result rows.
-        mode_key = _MODE_KEY[p['mode']]
-        if mode_key == 'erosion':
-            metrics = [
-                ('Radius / half-thickness', radius_vox),
-                ('Width / thickness', width_vox),
-                ('Full-width at half-maximum', fwhm_vox),
-            ]
-        else:
-            metrics = [
-                ('Half-spacing', radius_vox),
-                ('Inter-object spacing', width_vox),
-                ('Full-width at half-maximum', fwhm_vox),
-            ]
+        bases = self._metric_bases(_MODE_KEY[p['mode']])
 
         # utf-8-sig writes a BOM so Excel on Windows auto-detects UTF-8 and
         # renders the em dash / 'µm' correctly instead of mojibake ('â€”').
@@ -1313,70 +1991,87 @@ class PersistentHomologyWidget(QWidget):
             has_physical = self._write_metadata_header(w, p)
             w.writerow([])
 
+            header = ['Label_ID'] + [f'{b}_vox' for b in bases]
             if has_physical:
                 # Arithmetic mean — appropriate for length quantities.
                 mean_vox = (p['vx'] + p['vy'] + p['vz']) / 3.0
-                # Column name bakes the unit in (e.g. 'Value_nm'), so we
-                # drop the separate 'unit' column that used to repeat
-                # the same string on every row. ASCII 'um' instead of
-                # 'µm' is friendlier to downstream tooling.
+                # ASCII 'um' instead of 'µm' is friendlier to downstream
+                # tooling; the unit is baked into each column name.
                 column_unit = {'nm': 'nm', 'µm': 'um'}.get(unit, unit)
-                w.writerow(
-                    [
-                        'Metric',
-                        'Value_vox',
-                        f'Value_{column_unit}',
-                    ]
-                )
-                for label, vox in metrics:
-                    w.writerow(
-                        [
-                            label,
-                            f'{vox:.4f}',
-                            f'{vox * mean_vox:.4f}',
-                        ]
-                    )
-            else:
-                w.writerow(['Metric', 'Value_vox'])
-                for label, vox in metrics:
-                    w.writerow([label, f'{vox:.4f}'])
+                header += [f'{b}_{column_unit}' for b in bases]
+            w.writerow(header)
+
+            for rec in self._results:
+                # 'all' names the aggregate job (label_id is None there).
+                label = 'all' if rec['label_id'] is None else rec['label_id']
+                vox_vals = [
+                    rec['radius_vox'],
+                    rec['width_vox'],
+                    rec['fwhm_vox'],
+                ]
+                if not rec['ok']:
+                    row = [label] + ['NaN'] * len(bases)
+                    if has_physical:
+                        row += ['NaN'] * len(bases)
+                    w.writerow(row)
+                    continue
+                row = [label] + [f'{v:.4f}' for v in vox_vals]
+                if has_physical:
+                    row += [f'{v * mean_vox:.4f}' for v in vox_vals]
+                w.writerow(row)
 
         self._set_status(f'Results saved to {path}')
 
     def _on_save_curve_clicked(self) -> None:
-        """Save the raw + smoothed count curve as CSV *and* the embedded
-        matplotlib plot as a PNG, both derived from one user-picked path.
+        """Save the raw + smoothed count curve(s) as CSV *and* every count
+        curve plot as PNG(s), all derived from one user-picked path.
 
-        - If the user picks 'foo.csv' (or any path), the CSV is written
-          to 'foo.csv' and the figure to 'foo.png'. The existing
-          extension is stripped first so the two siblings share a base.
+        - If the user picks 'foo.csv' (or any path), the CSV is written to
+          'foo.csv' and the plots alongside it. The existing extension is
+          stripped first so all siblings share a base.
         - The CSV contains the same metadata header as the summary file
-          (mode + parameters + voxel size) plus three columns:
-          'Erosion_round' / 'Dilation_round', 'Count_raw', 'Count_smoothed'.
-        - The PNG is the current matplotlib figure rendered at 150 DPI
-          with tight bounding box.
+          (mode + parameters + voxel size) plus a tidy/long table with the
+          columns 'Label_ID', 'Erosion_round' / 'Dilation_round',
+          'Count_raw', 'Count_smoothed' — one block of rows per object
+          ('all' in aggregate mode).
+        - The PNGs are *all* count curve plots, not just the one on screen:
+          in per-object mode they go in a subfolder named exactly like the CSV
+          stem ('foo/') — one per object ('object_count_obj_<label>.png' /
+          'hole_count_obj_<label>.png') plus both overlays
+          ('<prefix>_overlay_smoothed.png' / '<prefix>_overlay_raw.png') when
+          applicable; in aggregate mode the single plot ('foo.png').
+          See '_save_all_plots'.
+
+        The dialog is prefilled with a structured default name
+        ('<Mode>_<analyze>_count_curve_data.csv'); the user can edit it, and if
+        the resulting CSV / PNG / plot folder already exists the stem is
+        auto-incremented ('_2', '_3', …) rather than overwritten.
 
         Does nothing if no successful run has been performed yet.
         """
-        if self._last_result is None:
+        if not self._results:
             return
 
         path, _ = QFileDialog.getSaveFileName(
-            self, 'Save Curve & Plot', '', 'CSV files (*.csv)'
+            self,
+            'Save Count Curve Data & Figures',
+            self._default_save_name('count_curve_data'),
+            'CSV files (*.csv)',
+            options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if not path:
             return
 
-        # Derive paired CSV / PNG paths from whatever the user typed.
-        base = path
-        for ext in ('.csv', '.png'):
-            if base.lower().endswith(ext):
-                base = base[: -len(ext)]
-                break
+        # Derive the shared base from whatever the user typed (CSV + PNGs).
+        base = self._strip_save_ext(path)
+        # Auto-increment ('_2', '_3', …) so a save never clobbers an earlier
+        # one. A single-object save also writes '<base>.png'; a multi-object
+        # save writes a '<base>/' plot folder — both must be free, not just
+        # the CSV, so the stem stays consistent across all outputs of one save.
+        extra = '.png' if len(self._results) <= 1 else ''
+        base = self._dedup_base(base, ['.csv', extra])
         csv_path = base + '.csv'
-        png_path = base + '.png'
 
-        series, smoothed, _, _, _, _ = self._last_result
         p = self._run_params
 
         # The x-axis column name reflects what each row means in the
@@ -1398,14 +2093,21 @@ class PersistentHomologyWidget(QWidget):
             w.writerow([curve_title])
             self._write_metadata_header(w, p, note_voxel_size_when_unset=False)
             w.writerow([])
-            w.writerow([round_column, 'Count_raw', 'Count_smoothed'])
-            # series and smoothed are always the same length (smoothing
-            # preserves it), so strict=True documents that invariant.
-            for i, (raw, sm) in enumerate(zip(series, smoothed, strict=True)):
-                w.writerow([i, int(raw), f'{sm:.4f}'])
+            w.writerow(
+                ['Label_ID', round_column, 'Count_raw', 'Count_smoothed']
+            )
+            for rec in self._results:
+                label = 'all' if rec['label_id'] is None else rec['label_id']
+                # series and smoothed are always the same length (smoothing
+                # preserves it), so strict=True documents that invariant.
+                for i, (raw, sm) in enumerate(
+                    zip(rec['series'], rec['smoothed'], strict=True)
+                ):
+                    w.writerow([label, i, int(raw), f'{sm:.4f}'])
 
-        # Save the current plot as a PNG. 'bbox_inches="tight"' trims the
-        # surrounding whitespace so the legend isn't clipped.
-        self._figure.savefig(png_path, dpi=150, bbox_inches='tight')
+        # Save every count curve plot as a PNG alongside the CSV.
+        png_paths = self._save_all_plots(base)
 
-        self._set_status(f'Curve saved to {csv_path}, plot to {png_path}')
+        self._set_status(
+            f'Curve saved to {csv_path}; {len(png_paths)} plot PNG(s) saved.'
+        )

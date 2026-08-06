@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from napari_persistent_homology.ph_functions import (
+    bounding_box_crop,
     compute_FWHM,
     compute_FWHM_v2,
     compute_homology_stats,
@@ -11,6 +12,7 @@ from napari_persistent_homology.ph_functions import (
     gaussian_average,
     hole_count,
     holes_count_internal_object,
+    label_subvolume,
     moving_average,
     object_count,
     persistent_homology_dilation,
@@ -673,3 +675,93 @@ class TestComputeHomologyStatsV2:
             )
         )
         assert smooth_max_count == pytest.approx(smoothed[step], rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# bounding_box_crop
+# ---------------------------------------------------------------------------
+
+
+class TestBoundingBoxCrop:
+    def test_crops_to_tight_bounds(self):
+        vol = np.zeros((20, 20, 20), dtype=np.uint8)
+        vol[3:6, 8:12, 15:20] = 1
+        cropped, bbox = bounding_box_crop(vol)
+        assert bbox == (3, 8, 15, 6, 12, 20)
+        assert cropped.shape == (3, 4, 5)
+        assert cropped.sum() == vol.sum()
+        assert cropped.all()  # bbox is fully filled for a solid block
+
+    def test_bbox_reindexes_original(self):
+        vol = np.zeros((10, 10, 10), dtype=np.uint8)
+        vol[2:4, 5:7, 1:9] = 1
+        cropped, (z0, y0, x0, z1, y1, x1) = bounding_box_crop(vol)
+        assert np.array_equal(cropped, vol[z0:z1, y0:y1, x0:x1])
+
+    def test_preserves_dtype(self):
+        vol = np.zeros((6, 6, 6), dtype=np.int32)
+        vol[1:3, 1:3, 1:3] = 7
+        cropped, _ = bounding_box_crop(vol)
+        assert cropped.dtype == np.int32
+
+    def test_empty_mask_raises(self):
+        vol = np.zeros((5, 5, 5), dtype=np.uint8)
+        with pytest.raises(ValueError):
+            bounding_box_crop(vol)
+
+
+# ---------------------------------------------------------------------------
+# label_subvolume
+# ---------------------------------------------------------------------------
+
+
+def _three_label_volume():
+    """3D volume with labels 1, 2, 3 in three disjoint boxes."""
+    vol = np.zeros((20, 20, 20), dtype=np.uint8)
+    vol[2:5, 2:5, 2:5] = 1
+    vol[10:14, 10:14, 10:14] = 2
+    vol[16:18, 1:3, 16:19] = 3
+    return vol
+
+
+class TestLabelSubvolume:
+    def test_extracts_only_requested_label(self):
+        vol = _three_label_volume()
+        obj, container, bbox = label_subvolume(vol, 2)
+        assert container is None
+        assert obj.dtype == np.uint8
+        assert set(np.unique(obj)).issubset({0, 1})
+        # label 2 occupied a 4x4x4 box, so the crop is exactly that
+        assert obj.shape == (4, 4, 4)
+        assert obj.sum() == 4**3
+        assert bbox == (10, 10, 10, 14, 14, 14)
+
+    def test_other_labels_excluded_from_crop(self):
+        # Two labels whose bounding boxes overlap in Z: cropping label 1
+        # must not pick up label 2's voxels even if they fall in the bbox.
+        vol = np.zeros((10, 10, 10), dtype=np.uint8)
+        vol[0:5, 0:5, 0:5] = 1
+        vol[0:5, 0:5, 5:10] = 2
+        obj, _, _ = label_subvolume(vol, 1)
+        assert obj.sum() == 5**3  # only label 1's voxels
+
+    def test_container_cropped_to_same_bbox(self):
+        vol = _three_label_volume()
+        container = np.ones((20, 20, 20), dtype=np.uint8)
+        obj, cont, bbox = label_subvolume(vol, 1, container_data=container)
+        assert cont is not None
+        assert cont.shape == obj.shape
+        assert cont.dtype == np.uint8
+        z0, y0, x0, z1, y1, x1 = bbox
+        assert cont.shape == (z1 - z0, y1 - y0, x1 - x0)
+
+    def test_container_binarized(self):
+        vol = _three_label_volume()
+        container = np.full((20, 20, 20), 7, dtype=np.uint8)  # non-1 labels
+        _, cont, _ = label_subvolume(vol, 1, container_data=container)
+        assert set(np.unique(cont)).issubset({0, 1})
+
+    def test_missing_label_raises(self):
+        vol = _three_label_volume()
+        with pytest.raises(ValueError):
+            label_subvolume(vol, 99)
