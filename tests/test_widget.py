@@ -9,6 +9,8 @@ from napari_persistent_homology._widget import (
     _MODE_EROSION,
     _MODE_KEY,
     PersistentHomologyWidget,
+    _make_step_callback,
+    _run_analysis,
     parse_label_ids,
 )
 
@@ -1281,3 +1283,390 @@ def test_save_curve_dedup_increments_on_folder_collision(
     assert (new_dir / 'object_count_obj_1.png').is_file()
     assert (new_dir / 'object_count_obj_2.png').is_file()
     assert not any((tmp_path / 'run').iterdir())
+
+
+def test_save_measurements_dedup_increments_to_third(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """Two pre-existing summary CSVs → the save lands on '_3', not '_2'."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget)
+
+    (tmp_path / 'foo.csv').write_text('first', encoding='utf-8')
+    (tmp_path / 'foo_2.csv').write_text('second', encoding='utf-8')
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(tmp_path / 'foo.csv'), 'CSV files (*.csv)'),
+    )
+    widget._on_save_clicked()
+
+    assert (tmp_path / 'foo_3.csv').is_file()
+    assert (tmp_path / 'foo.csv').read_text(encoding='utf-8') == 'first'
+    assert (tmp_path / 'foo_2.csv').read_text(encoding='utf-8') == 'second'
+
+
+def test_save_results_writes_physical_unit_columns(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """A physical-unit run adds '<base>_<unit>' columns with values scaled by
+    the mean voxel pitch; 'µm' is written as the ASCII column suffix 'um'."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    _fake_completed_run(widget, mode_text=_MODE_EROSION)  # radius_vox = 5.0
+    # Re-snapshot the run params as a physical (µm) run with a 2.0 mean pitch.
+    widget._run_params = _make_run_params(
+        _MODE_EROSION, unit='µm', vx=2.0, vy=2.0, vz=2.0
+    )
+
+    target = tmp_path / 'phys.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_clicked()
+
+    text = target.read_text(encoding='utf-8-sig')
+    # µm → 'um' column suffix; voxel columns are still present.
+    assert 'Radius_half_thickness_um' in text
+    assert 'Width_thickness_um' in text
+    assert 'FWHM_um' in text
+    assert 'Radius_half_thickness_vox' in text
+    # Physical radius = radius_vox (5.0) * mean pitch (2.0) = 10.0.
+    assert '10.0000' in text
+
+
+def test_save_results_degenerate_object_writes_nan(
+    make_napari_viewer, tmp_path, monkeypatch
+):
+    """An object with no detected peak is written as a NaN row in the summary."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    objects = _per_object_objects(2)
+    objects.append(
+        {
+            'label_id': 3,
+            'series': np.zeros(101),
+            'radius_vox': 0.0,
+            'fwhm_vox': 0.0,
+        }
+    )
+    _fake_completed_run(widget, objects=objects)
+
+    target = tmp_path / 'deg.csv'
+    monkeypatch.setattr(
+        'napari_persistent_homology._widget.QFileDialog.getSaveFileName',
+        lambda *_a, **_k: (str(target), 'CSV files (*.csv)'),
+    )
+    widget._on_save_clicked()
+
+    text = target.read_text(encoding='utf-8-sig')
+    # Voxel-only run (unit='vox'), so the degenerate label-3 row is all NaN.
+    assert '3,NaN,NaN,NaN' in text
+
+
+# ── Worker (_run_analysis) round-trips — anchor the fakes against the real
+#    worker so drift in the returned dict's keys/units is caught ─────────────
+
+
+def test_run_analysis_worker_aggregate_erosion_dict_shape():
+    """The aggregate worker returns exactly the dict '_on_result' consumes."""
+    vol = np.zeros((16, 16, 16), dtype=np.uint8)
+    vol[4:12, 4:12, 4:12] = 1
+    result = _run_analysis(
+        vol, None, 'erosion', False, [1], 0.5, 6, 26, 2, False, None
+    ).work()
+
+    assert result['analyze_each'] is False
+    assert result['mode_key'] == 'erosion'
+    assert result['curve_label'] == _CURVE_LABEL['erosion']
+    assert len(result['objects']) == 1
+    obj = result['objects'][0]
+    assert set(obj) == {'label_id', 'series', 'radius_vox', 'fwhm_vox'}
+    assert obj['label_id'] is None
+    assert isinstance(obj['radius_vox'], float)
+    assert isinstance(obj['fwhm_vox'], float)
+    assert len(obj['series']) > 0
+
+
+def test_run_analysis_worker_per_object_two_labels():
+    """Per-object mode yields one job per label, each keyed by its label ID."""
+    vol = np.zeros((16, 16, 16), dtype=np.uint8)
+    vol[2:6, 2:6, 2:6] = 1
+    vol[9:14, 9:14, 9:14] = 2
+    result = _run_analysis(
+        vol, None, 'erosion', True, [1, 2], 0.5, 6, 26, 2, False, None
+    ).work()
+
+    assert result['analyze_each'] is True
+    assert [o['label_id'] for o in result['objects']] == [1, 2]
+    for o in result['objects']:
+        assert set(o) == {'label_id', 'series', 'radius_vox', 'fwhm_vox'}
+
+
+def test_run_analysis_worker_aggregate_dilation():
+    """The dilation branch of _compute_series returns a hole-count curve."""
+    vol = np.zeros((16, 16, 16), dtype=np.uint8)
+    vol[3:6, 3:6, 3:6] = 1
+    vol[10:13, 10:13, 10:13] = 1
+    result = _run_analysis(
+        vol, None, 'dilation', False, [1], 0.5, 6, 26, 2, False, None
+    ).work()
+
+    assert result['mode_key'] == 'dilation'
+    assert result['curve_label'] == _CURVE_LABEL['dilation']
+    assert len(result['objects'][0]['series']) > 0
+
+
+def test_run_analysis_internal_with_container_runs():
+    """The dilation_internal branch runs with a valid container mask."""
+    vol = np.zeros((16, 16, 16), dtype=np.uint8)
+    vol[6:10, 6:10, 6:10] = 1
+    container = np.zeros((16, 16, 16), dtype=np.uint8)
+    container[3:13, 3:13, 3:13] = 1  # container encloses the object
+    result = _run_analysis(
+        vol,
+        container,
+        'dilation_internal',
+        False,
+        [1],
+        0.5,
+        6,
+        26,
+        2,
+        False,
+        None,
+    ).work()
+
+    assert result['mode_key'] == 'dilation_internal'
+    assert result['curve_label'] == _CURVE_LABEL['dilation_internal']
+    assert len(result['objects'][0]['series']) > 0
+
+
+def test_run_analysis_internal_empty_container_is_degenerate():
+    """An object whose cropped container is empty is flagged 'no peak' (radius/
+    FWHM = 0, a zeros curve) and the progress bar jumps past its slice — the
+    worker must not crash."""
+    vol = np.zeros((16, 16, 16), dtype=np.uint8)
+    vol[2:6, 2:6, 2:6] = 1  # object in one corner
+    container = np.zeros((16, 16, 16), dtype=np.uint8)
+    container[10:15, 10:15, 10:15] = 1  # container elsewhere — misses the bbox
+
+    steps = []
+    result = _run_analysis(
+        vol,
+        container,
+        'dilation_internal',
+        True,
+        [1],
+        0.5,
+        6,
+        26,
+        2,
+        False,
+        lambda s, t: steps.append((s, t)),
+    ).work()
+
+    obj = result['objects'][0]
+    assert obj['label_id'] == 1
+    assert obj['radius_vox'] == 0.0
+    assert obj['fwhm_vox'] == 0.0
+    assert len(obj['series']) == 6 + 1
+    assert np.all(obj['series'] == 0)
+    # Progress advanced past the object's slice (base 0 + max_steps 6).
+    assert steps[-1] == (6, 6)
+
+
+def test_make_step_callback_offsets_step_and_reports_total():
+    """_make_step_callback shifts the local step by 'base' and reports the
+    shared total, so one progress bar spans an N-object sweep."""
+    calls = []
+    cb = _make_step_callback(
+        base=6, total_steps=12, step_callback=lambda s, t: calls.append((s, t))
+    )
+    cb(3, 6)
+    assert calls == [(9, 12)]
+
+
+def test_make_step_callback_none_is_noop():
+    """A None step_callback is tolerated (no-op)."""
+    cb = _make_step_callback(0, 6, None)
+    cb(2, 6)  # must not raise
+
+
+# ── Worker signal slots ─────────────────────────────────────────────────────
+
+
+def test_on_error_capitalizes_message(make_napari_viewer):
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    widget._on_error(ValueError('boom happened'))
+    assert 'Error: Boom happened' in widget._status_label.text()
+
+
+def test_on_error_empty_message_does_not_crash(make_napari_viewer):
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    widget._on_error(ValueError(''))
+    assert 'Error' in widget._status_label.text()
+
+
+def test_on_finished_reenables_run_and_fills_bar(make_napari_viewer):
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    widget._run_btn.setEnabled(False)
+    widget._progress_bar.setRange(0, 50)
+    widget._progress_bar.setValue(10)
+
+    widget._on_finished()
+
+    assert widget._run_btn.isEnabled()
+    assert widget._progress_bar.value() == widget._progress_bar.maximum() == 50
+
+
+# ── Run-time validation branches ────────────────────────────────────────────
+
+
+def test_run_internal_no_container_selected_shows_error(make_napari_viewer):
+    viewer = make_napari_viewer()
+    viewer.add_labels(np.ones((10, 10, 10), dtype=np.uint8), name='seg')
+    widget = PersistentHomologyWidget(viewer)
+    widget._mode_combo.setCurrentText(_MODE_DILATION_INTERNAL)
+    widget._seg_combo.setCurrentText('seg')
+    widget._container_combo.clear()  # no container available/selected
+
+    widget._on_run_clicked()
+
+    text = widget._status_label.text()
+    assert 'Error' in text
+    assert 'container' in text.lower()
+
+
+def test_run_empty_segmentation_shows_error(make_napari_viewer):
+    viewer = make_napari_viewer()
+    viewer.add_labels(np.zeros((10, 10, 10), dtype=np.uint8), name='seg')
+    widget = PersistentHomologyWidget(viewer)
+    widget._seg_combo.setCurrentText('seg')
+
+    widget._on_run_clicked()
+
+    assert 'empty' in widget._status_label.text().lower()
+
+
+def test_run_with_absent_label_id_shows_error(make_napari_viewer):
+    viewer = make_napari_viewer()
+    data = np.zeros((10, 10, 10), dtype=np.uint8)
+    data[2:5, 2:5, 2:5] = 1
+    viewer.add_labels(data, name='seg')
+    widget = PersistentHomologyWidget(viewer)
+    widget._seg_combo.setCurrentText('seg')
+    widget._analyze_combo.setCurrentText('Each object')
+    widget._label_ids_edit.setText('99')  # not present → error before any run
+
+    widget._on_run_clicked()
+
+    assert 'Error' in widget._status_label.text()
+
+
+# ── parse_label_ids malformed inputs ────────────────────────────────────────
+
+
+@pytest.mark.parametrize('text', ['abc', '1,abc', '1 2 x', '[]'])
+def test_parse_label_ids_rejects_junk(text):
+    with pytest.raises(ValueError):
+        parse_label_ids(text, [1, 2, 3])
+
+
+@pytest.mark.parametrize('text', ['99', '-1'])
+def test_parse_label_ids_absent_label_raises(text):
+    with pytest.raises(ValueError):
+        parse_label_ids(text, [1, 2, 3])
+
+
+def test_parse_label_ids_whitespace_is_all():
+    assert parse_label_ids('   ', [3, 1, 2]) == [1, 2, 3]
+
+
+# ── _process_object display branches ────────────────────────────────────────
+
+
+def test_process_object_partial_pitch_falls_back_to_voxels(make_napari_viewer):
+    """A physical unit with one voxel dimension unset (0) shows voxel-only
+    strings (no physical brackets)."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    p = _make_run_params(_MODE_EROSION, unit='nm', vx=5.0, vy=5.0, vz=0.0)
+    rec = widget._process_object(
+        {
+            'label_id': 1,
+            'series': _plateau_series(),
+            'radius_vox': 5.0,
+            'fwhm_vox': 2.0,
+        },
+        p,
+    )
+    assert rec['ok'] is True
+    assert rec['radius_str'] == '5.00 vox'  # voxel-only, no '(… vox)' bracket
+
+
+def test_process_object_zero_at_peak_is_not_ok(make_napari_viewer):
+    """A non-zero radius whose peak step lands on a zero of the smoothed curve
+    is flagged degenerate ('—')."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    p = _make_run_params(_MODE_EROSION)  # Lambda 0.1 → peak step = 50
+    rec = widget._process_object(
+        {
+            'label_id': 1,
+            'series': np.zeros(101),  # flat, so smoothed[50] == 0
+            'radius_vox': 5.0,
+            'fwhm_vox': 2.0,
+        },
+        p,
+    )
+    assert rec['ok'] is False
+    assert rec['radius_str'] == '—'
+
+
+def test_selecting_degenerate_object_shows_no_peak_message(make_napari_viewer):
+    """Selecting a degenerate object in the plot selector blanks the metric
+    rows to '—' (its curve has no peak to display)."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    objects = _per_object_objects(1)  # label 1 valid
+    objects.append(
+        {
+            'label_id': 2,
+            'series': np.zeros(101),
+            'radius_vox': 0.0,
+            'fwhm_vox': 0.0,
+        }
+    )
+    _fake_completed_run(widget, objects=objects)
+
+    # combo index 1 = object 2 (the degenerate one), before the overlay entries.
+    widget._object_selector.setCurrentIndex(1)
+    assert widget._radius_label.text() == '—'
+
+
+# ── Small helpers ───────────────────────────────────────────────────────────
+
+
+def test_strip_save_ext_handles_csv_png_and_bare():
+    f = PersistentHomologyWidget._strip_save_ext
+    assert f('a/b/run.csv') == 'a/b/run'
+    assert f('a/b/run.PNG') == 'a/b/run'  # case-insensitive
+    assert f('a/b/run') == 'a/b/run'  # no known extension → unchanged
+    assert (
+        f('a/b/run.csv.png') == 'a/b/run.csv'
+    )  # strips only the trailing ext
+
+
+def test_seg_layer_returns_none_for_non_labels(make_napari_viewer):
+    """_seg_layer guards against the run's layer having become a non-Labels
+    layer (e.g. renamed onto an Image)."""
+    viewer = make_napari_viewer()
+    widget = PersistentHomologyWidget(viewer)
+    viewer.add_image(np.zeros((5, 5, 5)), name='img')
+    widget._run_params = _make_run_params(_MODE_EROSION, seg_name='img')
+    assert widget._seg_layer() is None

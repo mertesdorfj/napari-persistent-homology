@@ -765,3 +765,22 @@ class TestLabelSubvolume:
         vol = _three_label_volume()
         with pytest.raises(ValueError):
             label_subvolume(vol, 99)
+
+
+class TestMovingAverage:
+    def test_preserves_length(self):
+        x = np.arange(10, dtype=float)
+        assert moving_average(x, 3).shape == x.shape
+
+    def test_smooths_an_interior_spike(self):
+        # np.convolve([0,0,4,0,0], ones(3), 'same') / 3 → [0, 4/3, 4/3, 4/3, 0]
+        x = np.array([0, 0, 4, 0, 0], dtype=float)
+        out = moving_average(x, 3)
+        assert out[0] == pytest.approx(0.0)
+        assert out[2] == pytest.approx(4 / 3)
+        # An interior spike keeps its total mass across the window.
+        assert out.sum() == pytest.approx(x.sum())
+
+    def test_window_one_is_identity(self):
+        x = np.array([1.0, 2.0, 3.0])
+        assert np.allclose(moving_average(x, 1), x)

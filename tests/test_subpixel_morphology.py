@@ -2,9 +2,69 @@ import numpy as np
 import pytest
 
 from napari_persistent_homology.subpixel_morphology import (
+    subpixel_dilation_2D,
     subpixel_dilation_3D,
+    subpixel_erosion_2D,
     subpixel_erosion_3D,
 )
+
+
+def solid_square(size=10, blob_slice=slice(3, 7)):
+    """2D float32 field with a solid square of 1s in the centre."""
+    vol = np.zeros((size, size), dtype=np.float32)
+    vol[blob_slice, blob_slice] = 1.0
+    return vol
+
+
+class TestSubpixelDilation2D:
+    def test_output_shape_and_dtype(self):
+        vol = solid_square()
+        result = subpixel_dilation_2D(vol, t=0.1, Lambda=0.1)
+        assert result.shape == vol.shape
+        assert result.dtype == np.float32
+
+    def test_values_in_range(self):
+        result = subpixel_dilation_2D(solid_square(), t=0.5, Lambda=0.1)
+        assert result.min() >= 0.0
+        assert result.max() <= 1.0
+
+    def test_expands_into_neighbours(self):
+        vol = np.zeros((10, 10), dtype=np.float32)
+        vol[5, 5] = 1.0
+        result = subpixel_dilation_2D(vol, t=0.5, Lambda=0.1)
+        assert result[5, 6] > 0.0
+        assert result[4, 5] > 0.0
+
+    def test_all_ones_stays_saturated(self):
+        result = subpixel_dilation_2D(np.ones((6, 6), np.float32), 0.5, 0.1)
+        assert np.allclose(result, 1.0)
+
+    def test_all_zeros_stays_zero(self):
+        result = subpixel_dilation_2D(np.zeros((6, 6), np.float32), 0.5, 0.1)
+        assert np.allclose(result, 0.0)
+
+
+class TestSubpixelErosion2D:
+    def test_output_shape_and_dtype(self):
+        vol = solid_square()
+        result = subpixel_erosion_2D(vol, t=0.1, Lambda=0.1)
+        assert result.shape == vol.shape
+        assert result.dtype == np.float32
+
+    def test_values_in_range(self):
+        result = subpixel_erosion_2D(solid_square(), t=0.5, Lambda=0.1)
+        assert result.min() >= 0.0
+        assert result.max() <= 1.0
+
+    def test_shrinks_at_the_boundary(self):
+        # Erosion retreats the front: an edge voxel of the square loses value.
+        vol = solid_square()
+        result = subpixel_erosion_2D(vol, t=0.5, Lambda=0.1)
+        assert result[3, 3] < 1.0  # corner of the square
+
+    def test_all_zeros_stays_zero(self):
+        result = subpixel_erosion_2D(np.zeros((6, 6), np.float32), 0.5, 0.1)
+        assert np.allclose(result, 0.0)
 
 
 def solid_cube(size=10, blob_slice=slice(3, 7)):
