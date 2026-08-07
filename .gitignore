@@ -84,3 +84,6 @@ venv/
 **/_version.py
 CLAUDE.md
 .claude/
+
+# Personal, per-session work log — local only, never committed
+SESSION_LOG.md
